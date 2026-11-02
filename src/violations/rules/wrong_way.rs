@@ -5,8 +5,8 @@ use uuid::Uuid;
 use crate::lib::track_observations::{PointPx, TrackObservation};
 use crate::violations::coordinator::RuleRuntimeConfig;
 use crate::violations::event::{ViolationEvent, ViolationStatus};
-use crate::violations::rules::geometry::contains_point;
 use crate::violations::rules::ViolationRule;
+use crate::violations::rules::geometry::contains_point;
 
 #[derive(Debug, Clone)]
 struct TrackState {
@@ -44,8 +44,7 @@ impl WrongWayRule {
         runtime: RuleRuntimeConfig,
     ) -> Self {
         let allowed_direction_unit =
-            Self::normalize(allowed_direction[0], allowed_direction[1])
-                .unwrap_or((0.0, 0.0));
+            Self::normalize(allowed_direction[0], allowed_direction[1]).unwrap_or((0.0, 0.0));
 
         Self {
             rule_id: format!("{zone_id}.wrong_way"),
@@ -67,15 +66,18 @@ impl WrongWayRule {
     }
 
     /// Removes track state older than the configured TTL when cleanup is due.
-    /// Age is measured from each track's last observation in source time.
+    /// Age is measured from each track's last observation in source time;
+    /// entries with a negative age are discarded too.
     fn cleanup_if_needed(&mut self, now: f32) {
         if now < self.next_cleanup_at {
             return;
         }
 
         let ttl = self.state_ttl_sec;
-        self.tracks
-            .retain(|_, state| now - state.last_seen_at <= ttl);
+        self.tracks.retain(|_, state| {
+            let age = now - state.last_seen_at;
+            age >= 0.0 && age <= ttl
+        });
 
         self.next_cleanup_at = now + self.cleanup_interval_sec;
     }
@@ -109,12 +111,7 @@ impl WrongWayRule {
     /// Builds a confirmed wrong-way event using the current observation,
     /// normalized movement direction, and its alignment with the allowed
     /// direction. The details include the configured sample threshold.
-    fn make_event(
-        &self,
-        obs: &TrackObservation,
-        movement: (f32, f32),
-        dot: f32,
-    ) -> ViolationEvent {
+    fn make_event(&self, obs: &TrackObservation, movement: (f32, f32), dot: f32) -> ViolationEvent {
         ViolationEvent {
             event_id: Uuid::new_v4(),
             event_type: "traffic.wrong_way".to_string(),
@@ -133,14 +130,12 @@ impl WrongWayRule {
             previous_zone_id: obs.previous_zone_id.clone(),
             crossed_virtual_line: obs.crossed_virtual_line,
             speed_kmh: obs.speed_kmh,
+            solid_line_id: None,
+            intersection_px: None,
             rule_id: self.rule_id.clone(),
             details: format!(
                 "track moved in forbidden direction in zone '{}' after {} samples; movement=({:.3}, {:.3}), alignment={:.3}",
-                self.zone_id,
-                self.min_direction_samples,
-                movement.0,
-                movement.1,
-                dot,
+                self.zone_id, self.min_direction_samples, movement.0, movement.1, dot,
             ),
         }
     }
@@ -158,11 +153,11 @@ impl ViolationRule for WrongWayRule {
     /// Already reported tracks refresh their state without emitting again.
     /// A zone mismatch or a point outside the polygon removes track state,
     /// allowing a subsequent visit to be evaluated independently.
-    ///
-    /// The current implementation initializes samples to one and increments
-    /// it during the same call, so the first observation is counted twice.
     fn process(&mut self, obs: &TrackObservation) -> Vec<ViolationEvent> {
         let now = obs.source_time_relative_sec;
+        if !now.is_finite() {
+            return Vec::new();
+        }
         self.cleanup_if_needed(now);
 
         if obs.zone_id.as_deref() != Some(self.zone_id.as_str()) {
@@ -186,7 +181,7 @@ impl ViolationRule for WrongWayRule {
             first_point: current_point.clone(),
             last_point: current_point.clone(),
             last_seen_at: now,
-            samples: 1,
+            samples: 0,
             fired: false,
         });
 
@@ -212,8 +207,7 @@ impl ViolationRule for WrongWayRule {
         };
 
         let dot = movement.0 * allowed.0 + movement.1 * allowed.1;
-        let moved_this_step =
-            Self::movement_direction(&previous_point, &current_point).is_some();
+        let moved_this_step = Self::movement_direction(&previous_point, &current_point).is_some();
 
         if moved_this_step && dot < -0.2 {
             state.fired = true;
@@ -221,5 +215,73 @@ impl ViolationRule for WrongWayRule {
         }
 
         Vec::new()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lib::track_observations::test_support::observation;
+    use crate::violations::coordinator::RuleRuntimeConfig;
+    use uuid::Uuid;
+
+    fn rule() -> WrongWayRule {
+        WrongWayRule::from_embedded(
+            "zone-a".to_string(),
+            vec![[0, 0], [100, 0], [100, 100], [0, 100]],
+            [0.0, -1.0],
+            3,
+            RuleRuntimeConfig {
+                state_ttl_sec: 7.0,
+                cleanup_interval_sec: 1.0,
+            },
+        )
+    }
+
+    #[test]
+    fn sample_threshold_is_not_off_by_one() {
+        let mut rule = rule();
+        let track = Uuid::new_v4();
+
+        assert!(
+            rule.process(&observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None))
+                .is_empty()
+        );
+        // Second observation: two samples so far, threshold is three.
+        assert!(
+            rule.process(&observation(track, 1.0, 50.0, 60.0, Some("zone-a"), None))
+                .is_empty()
+        );
+        // Third observation: movement from the first point is opposite to
+        // the allowed [0, -1] direction.
+        assert_eq!(
+            rule.process(&observation(track, 2.0, 50.0, 70.0, Some("zone-a"), None))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_time_does_not_clear_track_state() {
+        let mut rule = rule();
+        let track = Uuid::new_v4();
+
+        assert!(
+            rule.process(&observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None))
+                .is_empty()
+        );
+        assert_eq!(rule.tracks.len(), 1);
+
+        assert!(
+            rule.process(&observation(
+                track,
+                f32::NAN,
+                50.0,
+                60.0,
+                Some("zone-a"),
+                None
+            ))
+            .is_empty()
+        );
+        assert_eq!(rule.tracks.len(), 1);
     }
 }

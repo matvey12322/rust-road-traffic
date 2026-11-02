@@ -6,7 +6,6 @@ use crate::settings::{RoadLanesSettings, ViolationsSettings};
 use crate::violations::event::ViolationEvent;
 use crate::violations::rules::no_parking::NoParkingRule;
 use crate::violations::rules::no_stopping::NoStoppingRule;
-use crate::violations::rules::solid_line::SolidLineRule;
 use crate::violations::rules::speeding::SpeedingRule;
 use crate::violations::rules::wrong_way::WrongWayRule;
 use crate::violations::rules::ViolationRule;
@@ -44,14 +43,6 @@ impl ViolationCoordinator {
 
             for lane in road_lanes {
                 let zone_id = lane.zone_id();
-
-                if let Some(rule) = &lane.rules.solid_line {
-                    rules.push(Box::new(SolidLineRule::from_embedded(
-                        zone_id.clone(),
-                        rule.clone(),
-                        runtime,
-                    )));
-                }
 
                 if let Some(rule) = &lane.rules.speeding {
                     rules.push(Box::new(SpeedingRule::from_embedded(

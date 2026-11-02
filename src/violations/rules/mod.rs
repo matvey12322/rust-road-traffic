@@ -1,7 +1,6 @@
 pub mod geometry;
 pub mod no_parking;
 pub mod no_stopping;
-pub mod solid_line;
 pub mod speeding;
 pub mod wrong_way;
 

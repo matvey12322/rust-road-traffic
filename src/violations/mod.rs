@@ -2,6 +2,7 @@ pub mod coordinator;
 pub mod event;
 pub mod rules;
 pub mod sink;
+pub mod solid_line;
 
 use crate::lib::track_observations::{TrackObservationRx, TrackObservations};
 use crate::settings::{RoadLanesSettings, ViolationsSettings};

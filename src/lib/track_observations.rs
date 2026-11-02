@@ -96,9 +96,7 @@ pub fn spawn_console_observer(tx: &TrackObservations) -> JoinHandle<()> {
         loop {
             match rx.recv().await {
                 Ok(obs) => match serde_json::to_string(&*obs) {
-                    Ok(json) => {
-
-                    }
+                    Ok(json) => {}
                     Err(err) => {
                         warn!(
                             target: "track_observation",
@@ -124,4 +122,43 @@ pub fn spawn_console_observer(tx: &TrackObservations) -> JoinHandle<()> {
             }
         }
     })
+}
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use chrono::Utc;
+
+    /// Minimal observation for rule unit tests: the anchor and image point are
+    /// the same, the box is 20x20 around that point.
+    pub fn observation(
+        track_id: Uuid,
+        time: f32,
+        x: f32,
+        y: f32,
+        zone_id: Option<&str>,
+        speed_kmh: Option<f32>,
+    ) -> TrackObservation {
+        TrackObservation {
+            equipment_id: "eq".to_string(),
+            track_id,
+            observed_at: Utc::now(),
+            source_time_relative_sec: time,
+            class_name: "car".to_string(),
+            confidence: 0.9,
+            bbox: BoundingBoxPx {
+                x: (x - 10.0).round() as i32,
+                y: (y - 10.0).round() as i32,
+                width: 20,
+                height: 20,
+            },
+            anchor_px: PointPx { x, y },
+            image_point_px: PointPx { x, y },
+            projected_point: None,
+            speed_kmh,
+            zone_id: zone_id.map(str::to_string),
+            previous_zone_id: None,
+            crossed_virtual_line: false,
+            no_match_times: 0,
+        }
+    }
 }

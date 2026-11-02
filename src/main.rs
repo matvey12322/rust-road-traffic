@@ -32,6 +32,9 @@ mod settings;
 mod video_capture;
 mod violations;
 
+use violations::sink::{ConsoleSink, EventSink};
+use violations::solid_line::{SolidLineDefinition, SolidLineDetector};
+
 use settings::AppSettings;
 use video_capture::{frame_channel, kill_capture_subprocesses, ThreadedFrame, VideoSource};
 
@@ -104,63 +107,6 @@ impl From<video_capture::CaptureError> for AppError {
 impl From<lib::data_storage::DataStorageError> for AppError {
     fn from(e: lib::data_storage::DataStorageError) -> Self {
         AppError::DataStorage(e)
-    }
-}
-
-fn draw_solid_line_rules(
-    frame: &mut lib::cv::RawFrame,
-    lanes: &[settings::RoadLanesSettings],
-) {
-    use lib::draw::primitives::draw_line_thick;
-
-    let width = frame.cols() as usize;
-    let height = frame.rows() as usize;
-    let step = frame.step();
-    let bytes = frame.data_bytes_mut();
-
-    for lane in lanes {
-        let Some(rule) = lane.rules.solid_line.as_ref() else {
-            continue;
-        };
-
-        if !rule.line.iter().flatten().all(|value| value.is_finite()) {
-            continue;
-        }
-
-        let [[ax, ay], [bx, by]] = rule.line;
-
-        let x1 = ax.round() as i32;
-        let y1 = ay.round() as i32;
-        let x2 = bx.round() as i32;
-        let y2 = by.round() as i32;
-
-        // Black outline.
-        draw_line_thick(
-            bytes,
-            step,
-            width,
-            height,
-            x1,
-            y1,
-            x2,
-            y2,
-            [0, 0, 0],
-            7,
-        );
-
-        // Yellow solid line. Frame colors are BGR.
-        draw_line_thick(
-            bytes,
-            step,
-            width,
-            height,
-            x1,
-            y1,
-            x2,
-            y2,
-            [0, 255, 255],
-            3,
-        );
     }
 }
 
@@ -300,6 +246,14 @@ fn run(
         settings.violations.clone(),
         settings.road_lanes.clone().unwrap_or_default(),
     );
+    // Solid lines are detected outside the zone observation stream: every
+    // active track is fed to this detector once per frame, so a line that lies
+    // outside any zone still catches a crossing.
+    let mut solid_line_detector = SolidLineDetector::new(
+        settings.violations.state_ttl_sec,
+        settings.violations.cleanup_interval_sec,
+    );
+    let solid_line_sink = ConsoleSink;
     let enable_vehicle_events = !report_mode
         && (settings.rest_api.enable || settings.redis_publisher.vehicle_events.enable);
     let mut event_collector = enable_vehicle_events.then(|| {
@@ -532,6 +486,11 @@ fn run(
     };
 
     let mut first_frame = None;
+    // `vehicle_last_zone_cross` is updated on every virtual-line crossing and
+    // would otherwise keep every track id ever seen. Pruning it against the
+    // tracker's live set costs little and runs rarely.
+    const VEHICLE_ZONE_MAP_PRUNE_INTERVAL: u32 = 300;
+    let mut frames_since_vehicle_map_prune: u32 = 0;
     while let Some(received) = rx_capture.recv() {
         let observed_at = Utc::now();
         if report_mode && first_frame.is_none() {
@@ -669,6 +628,23 @@ fn run(
             .read()
             .expect("Zone grid is poisoned [RWLock]");
 
+        // Lines are read from the running zones, not from the settings this
+        // process started with: moving a line through the REST API must take
+        // effect on the next frame, without a restart.
+        let solid_lines: Vec<SolidLineDefinition> = if settings.violations.enabled {
+            zones
+                .iter()
+                .filter_map(|(zone_id, zone_guarded)| {
+                    let zone = zone_guarded.lock().expect("Zone is poisoned [Mutex]");
+                    zone.get_solid_line()
+                        .filter(|line| line.is_valid())
+                        .map(|line| SolidLineDefinition::from_zone(zone_id.clone(), line))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         if let Some(collector) = event_collector.as_mut() {
             collector.observe_detections(
                 &tmp_detections,
@@ -693,6 +669,11 @@ fn run(
             .iter_tracked_objects()
             .filter_map(|(id, obj)| if obj.get_no_match_times() <= 1 { Some(id) } else { None })
             .collect();
+
+        // One observation per active track for the global solid-line detector.
+        // Unlike the per-zone observations below, these are produced whether or
+        // not the track is inside any zone.
+        let mut global_observations: Vec<TrackObservation> = Vec::with_capacity(object_ids.len());
 
         for object_id in object_ids {
             let (last_point_x, last_point_y, last_before_point, no_match_times, bbox) = {
@@ -742,6 +723,27 @@ fn run(
             let class_name = object_extra.get_classname();
             let detection_confidence = object_extra.get_confidence();
 
+            let anchor_x = bbox.x + bbox.width / 2.0;
+            let anchor_y = bbox.y + bbox.height;
+            let bbox_px = BoundingBoxPx {
+                x: bbox.x.floor() as i32,
+                y: bbox.y.floor() as i32,
+                width: bbox.width.round() as i32,
+                height: bbox.height.round() as i32,
+            };
+            let anchor_px = PointPx {
+                x: anchor_x,
+                y: anchor_y,
+            };
+
+            // Filled if the track is inside a zone. The solid-line detector
+            // does not need a zone, but a zone gives the event its speed and
+            // projected point when they are available.
+            let mut matched_zone_id: Option<String> = None;
+            let mut matched_projected_point: Option<PointProjected> = None;
+            let mut matched_speed_kmh: Option<f32> = None;
+            let mut matched_crossed_virtual_line = false;
+
             // Use zone grid for O(1) candidate lookup instead of O(m) iteration
             let candidate_zone_ids = zone_grid.get_candidate_zones(last_point_x, last_point_y);
             for zone_id in candidate_zone_ids {
@@ -760,14 +762,20 @@ fn run(
 
                 let crossed = if let Some(before_point) = last_before_point {
                     zone.crossed_virtual_line(
-                        last_point_x,
-                        last_point_y,
                         before_point.0,
                         before_point.1,
+                        last_point_x,
+                        last_point_y,
                     )
                 } else {
                     false
                 };
+                matched_zone_id = Some(zone.id.clone());
+                matched_projected_point = Some(PointProjected {
+                    x: projected_pt.0,
+                    y: projected_pt.1,
+                });
+                matched_crossed_virtual_line = crossed;
                 // Only provide zone_id_from when vehicle actually crosses the virtual line
                 let zone_id_from = if crossed {
                     previous_zone_id.clone()
@@ -791,6 +799,7 @@ fn run(
                         } else {
                             None
                         };
+                        matched_speed_kmh = speed_kmh;
 
                         let counted_in_zone = zone.register_or_update_object(
                             object_id,
@@ -802,9 +811,6 @@ fn run(
                             zone_id_from.clone(),
                         );
 
-                        let anchor_x = bbox.x + (bbox.width / 2.0);
-                        let anchor_y = bbox.y + bbox.height;
-
                         publish_track_observation(
                             &track_observations,
                             TrackObservation {
@@ -814,16 +820,8 @@ fn run(
                                 source_time_relative_sec: relative_time,
                                 class_name: class_name.clone(),
                                 confidence: detection_confidence,
-                                bbox: BoundingBoxPx {
-                                    x: bbox.x.floor() as i32,
-                                    y: bbox.y.floor() as i32,
-                                    width: bbox.width.round() as i32,
-                                    height: bbox.height.round() as i32,
-                                },
-                                anchor_px: PointPx {
-                                    x: anchor_x,
-                                    y: anchor_y,
-                                },
+                                bbox: bbox_px.clone(),
+                                anchor_px: anchor_px.clone(),
                                 image_point_px: PointPx {
                                     x: last_point_x,
                                     y: last_point_y,
@@ -861,9 +859,6 @@ fn run(
                             zone_id_from.clone(),
                         );
 
-                        let anchor_x = bbox.x + (bbox.width / 2.0);
-                        let anchor_y = bbox.y + bbox.height;
-
                         publish_track_observation(
                             &track_observations,
                             TrackObservation {
@@ -873,16 +868,8 @@ fn run(
                                 source_time_relative_sec: relative_time,
                                 class_name: class_name.clone(),
                                 confidence: detection_confidence,
-                                bbox: BoundingBoxPx {
-                                    x: bbox.x.floor() as i32,
-                                    y: bbox.y.floor() as i32,
-                                    width: bbox.width.round() as i32,
-                                    height: bbox.height.round() as i32,
-                                },
-                                anchor_px: PointPx {
-                                    x: anchor_x,
-                                    y: anchor_y,
-                                },
+                                bbox: bbox_px.clone(),
+                                anchor_px: anchor_px.clone(),
                                 image_point_px: PointPx {
                                     x: last_point_x,
                                     y: last_point_y,
@@ -918,6 +905,51 @@ fn run(
                 // Vehicle can only be in one zone at a time
                 break;
             }
+
+            if settings.violations.enabled {
+                global_observations.push(TrackObservation {
+                    equipment_id: ds_guard.id.clone(),
+                    track_id: object_id,
+                    observed_at,
+                    source_time_relative_sec: relative_time,
+                    class_name: class_name.clone(),
+                    confidence: detection_confidence,
+                    bbox: bbox_px.clone(),
+                    anchor_px: anchor_px.clone(),
+                    image_point_px: PointPx {
+                        x: last_point_x,
+                        y: last_point_y,
+                    },
+                    projected_point: matched_projected_point,
+                    speed_kmh: matched_speed_kmh,
+                    zone_id: matched_zone_id,
+                    previous_zone_id: previous_zone_id.clone(),
+                    crossed_virtual_line: matched_crossed_virtual_line,
+                    no_match_times,
+                });
+            }
+        }
+
+        if settings.violations.enabled {
+            let events = solid_line_detector.process_frame(&solid_lines, &global_observations);
+            for event in events {
+                solid_line_sink.publish(&event);
+            }
+        }
+
+        frames_since_vehicle_map_prune += 1;
+        if frames_since_vehicle_map_prune >= VEHICLE_ZONE_MAP_PRUNE_INTERVAL {
+            frames_since_vehicle_map_prune = 0;
+            let active_tracks: HashSet<Uuid> = tracker
+                .iter_tracked_objects()
+                .map(|(track_id, _)| track_id)
+                .collect();
+            let mut vehicle_zones = ds_guard
+                .vehicle_last_zone_cross
+                .write()
+                .expect("Vehicle zones is poisoned [RWLock]");
+            vehicle_zones.retain(|track_id, _| active_tracks.contains(track_id));
+            drop(vehicle_zones);
         }
 
         /* Re-stream input video as MJPEG */
@@ -933,11 +965,8 @@ fn run(
                 zone.draw_skeleton(&mut frame);
                 zone.draw_current_intensity(&mut frame);
                 zone.draw_virtual_line(&mut frame);
+                zone.draw_solid_line(&mut frame);
                 drop(zone);
-            }
-
-            if let Some(lanes) = settings.road_lanes.as_deref() {
-                draw_solid_line_rules(&mut frame, lanes);
             }
 
             drop(zone_grid);

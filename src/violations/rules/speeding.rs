@@ -6,8 +6,8 @@ use crate::lib::track_observations::{PointPx, TrackObservation};
 use crate::settings::LaneSpeedingRuleSettings;
 use crate::violations::coordinator::RuleRuntimeConfig;
 use crate::violations::event::{ViolationEvent, ViolationStatus};
-use crate::violations::rules::geometry::contains_point;
 use crate::violations::rules::ViolationRule;
+use crate::violations::rules::geometry::contains_point;
 
 pub struct SpeedingRule {
     rule_id: String,
@@ -87,6 +87,8 @@ impl SpeedingRule {
             previous_zone_id: obs.previous_zone_id.clone(),
             crossed_virtual_line: obs.crossed_virtual_line,
             speed_kmh: Some(speed_kmh),
+            solid_line_id: None,
+            intersection_px: None,
             rule_id: self.rule_id.clone(),
             details: format!(
                 "track exceeded speed threshold inside zone '{}' ({:.2} km/h > {:.2} km/h)",
@@ -101,12 +103,10 @@ impl ViolationRule for SpeedingRule {
     /// is inside the configured polygon and its valid speed strictly
     /// exceeds the configured threshold.
     ///
-    /// Already reported tracks refresh their last-seen timestamp before
-    /// geometry and speed checks, suppressing repeated events while
-    /// observations keep their records alive.
-    ///
-    /// Expired records are removed before processing, allowing a track
-    /// to produce another event after an observation gap exceeding the TTL.
+    /// Only observations from this rule's zone are considered. The
+    /// deduplication record is kept while the track stays in the zone and is
+    /// dropped when it leaves the zone or the polygon, so a later visit can
+    /// be reported again.
     fn process(&mut self, obs: &TrackObservation) -> Vec<ViolationEvent> {
         let now = obs.source_time_relative_sec;
 
@@ -129,14 +129,16 @@ impl ViolationRule for SpeedingRule {
             self.fired_tracks.remove(&obs.track_id);
         }
 
-        // Refresh before geometry/speed checks so an observed track
-        // does not lose its deduplication record.
-        if let Some(last_seen_at) = self.fired_tracks.get_mut(&obs.track_id) {
-            *last_seen_at = now;
+        // A rule only applies to observations from its own zone. Otherwise an
+        // observation from an overlapping or stale zone could be reported
+        // against the wrong zone.
+        if obs.zone_id.as_deref() != Some(self.zone_id.as_str()) {
+            self.fired_tracks.remove(&obs.track_id);
             return Vec::new();
         }
 
         if !contains_point(&self.polygon_px, &obs.anchor_px) {
+            self.fired_tracks.remove(&obs.track_id);
             return Vec::new();
         }
 
@@ -149,8 +151,106 @@ impl ViolationRule for SpeedingRule {
             return Vec::new();
         }
 
+        // Suppress repeats while the same speeding episode continues.
+        if let Some(last_seen_at) = self.fired_tracks.get_mut(&obs.track_id) {
+            *last_seen_at = now;
+            return Vec::new();
+        }
+
         self.fired_tracks.insert(obs.track_id, now);
 
         vec![self.make_event(obs, speed_kmh)]
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lib::track_observations::test_support::observation;
+    use crate::settings::LaneSpeedingRuleSettings;
+    use crate::violations::coordinator::RuleRuntimeConfig;
+    use uuid::Uuid;
+
+    fn rule() -> SpeedingRule {
+        SpeedingRule::from_embedded(
+            "zone-a".to_string(),
+            vec![[0, 0], [100, 0], [100, 100], [0, 100]],
+            LaneSpeedingRuleSettings {
+                threshold_kmh: 50.0,
+            },
+            RuleRuntimeConfig {
+                state_ttl_sec: 7.0,
+                cleanup_interval_sec: 1.0,
+            },
+        )
+    }
+
+    #[test]
+    fn only_own_zone_and_new_speeding_episode() {
+        let mut rule = rule();
+        let track = Uuid::new_v4();
+
+        // Another zone must not create an event even if its point is inside
+        // this rule's polygon.
+        assert!(
+            rule.process(&observation(
+                track,
+                1.0,
+                50.0,
+                50.0,
+                Some("zone-b"),
+                Some(60.0)
+            ))
+            .is_empty()
+        );
+        // Own zone: first speeding event.
+        assert_eq!(
+            rule.process(&observation(
+                track,
+                1.1,
+                50.0,
+                50.0,
+                Some("zone-a"),
+                Some(60.0)
+            ))
+            .len(),
+            1
+        );
+        // Still speeding in the same episode: suppressed.
+        assert!(
+            rule.process(&observation(
+                track,
+                1.2,
+                50.0,
+                50.0,
+                Some("zone-a"),
+                Some(60.0)
+            ))
+            .is_empty()
+        );
+        // Leaving the zone clears the deduplication record.
+        assert!(
+            rule.process(&observation(
+                track,
+                1.3,
+                50.0,
+                50.0,
+                Some("zone-b"),
+                Some(60.0)
+            ))
+            .is_empty()
+        );
+        // A later visit to the own zone can report again.
+        assert_eq!(
+            rule.process(&observation(
+                track,
+                1.4,
+                50.0,
+                50.0,
+                Some("zone-a"),
+                Some(60.0)
+            ))
+            .len(),
+            1
+        );
     }
 }

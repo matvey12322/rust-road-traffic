@@ -6,8 +6,12 @@ use crate::lib::track_observations::{PointPx, TrackObservation};
 use crate::settings::LaneZoneViolationRuleSettings;
 use crate::violations::coordinator::RuleRuntimeConfig;
 use crate::violations::event::{ViolationEvent, ViolationStatus};
-use crate::violations::rules::geometry::contains_point;
 use crate::violations::rules::ViolationRule;
+use crate::violations::rules::geometry::contains_point;
+
+/// A stationary period must be observed continuously. A longer gap means the
+/// track was not visible and the timer restarts.
+const MAX_STATIONARY_OBSERVATION_GAP_SEC: f32 = 1.0;
 
 #[derive(Debug, Clone)]
 struct TrackState {
@@ -97,6 +101,8 @@ impl NoStoppingRule {
             previous_zone_id: obs.previous_zone_id.clone(),
             crossed_virtual_line: obs.crossed_virtual_line,
             speed_kmh: obs.speed_kmh,
+            solid_line_id: None,
+            intersection_px: None,
             rule_id: self.rule_id.clone(),
             details: format!(
                 "track remained stationary in no-stopping zone '{}' for {:.2} sec (threshold {:.2} sec)",
@@ -111,12 +117,13 @@ impl ViolationRule for NoStoppingRule {
     /// has remained inside the polygon at or below the stationary speed
     /// threshold for the configured duration.
     ///
-    /// Before an event is emitted, leaving the polygon or receiving an
-    /// invalid or excessive speed resets the stationary timer.
-    /// Observation gaps within the state TTL do not reset the timer.
+    /// Only observations from this rule's zone are considered. Leaving the
+    /// polygon, receiving an invalid or excessive speed, or a gap longer than
+    /// `MAX_STATIONARY_OBSERVATION_GAP_SEC` resets the stationary timer.
     ///
     /// After an event is emitted, further events for the same track are
-    /// suppressed while observations keep its state alive.
+    /// suppressed while it remains stationary in this zone. Leaving the zone
+    /// or moving again removes the state, so a later stop can be reported.
     fn process(&mut self, obs: &TrackObservation) -> Vec<ViolationEvent> {
         let now = obs.source_time_relative_sec;
 
@@ -136,14 +143,12 @@ impl ViolationRule for NoStoppingRule {
             self.tracks.remove(&obs.track_id);
         }
 
-        // Refresh reported tracks before any early return.
-        // A visible track must not lose its deduplication record.
-        if let Some(state) = self.tracks.get_mut(&obs.track_id) {
-            state.last_seen_at = now;
-
-            if state.fired {
-                return Vec::new();
-            }
+        // A rule only applies to observations from its own zone. Otherwise an
+        // observation from an overlapping or stale zone could be reported
+        // against the wrong zone.
+        if obs.zone_id.as_deref() != Some(self.zone_id.as_str()) {
+            self.tracks.remove(&obs.track_id);
+            return Vec::new();
         }
 
         if !contains_point(&self.polygon_px, &obs.image_point_px) {
@@ -165,6 +170,20 @@ impl ViolationRule for NoStoppingRule {
             return Vec::new();
         }
 
+        // A gap longer than a normal frame interval means the track was not
+        // continuously visible; it must not make the stationary timer look
+        // longer than the observation period really was.
+        if let Some(state) = self.tracks.get_mut(&obs.track_id) {
+            let gap = now - state.last_seen_at;
+            state.last_seen_at = now;
+            if state.fired {
+                return Vec::new();
+            }
+            if gap > MAX_STATIONARY_OBSERVATION_GAP_SEC {
+                state.entered_at = now;
+            }
+        }
+
         let state = self.tracks.entry(obs.track_id).or_insert(TrackState {
             entered_at: now,
             last_seen_at: now,
@@ -182,5 +201,133 @@ impl ViolationRule for NoStoppingRule {
         state.fired = true;
 
         vec![self.make_event(obs, duration_sec)]
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lib::track_observations::test_support::observation;
+    use crate::settings::LaneZoneViolationRuleSettings;
+    use crate::violations::coordinator::RuleRuntimeConfig;
+    use uuid::Uuid;
+
+    fn rule() -> NoStoppingRule {
+        NoStoppingRule::from_embedded(
+            "zone-a".to_string(),
+            vec![[0, 0], [100, 0], [100, 100], [0, 100]],
+            LaneZoneViolationRuleSettings {
+                min_duration_sec: 2.0,
+                stationary_speed_kmh: 5.0,
+            },
+            RuleRuntimeConfig {
+                state_ttl_sec: 7.0,
+                cleanup_interval_sec: 1.0,
+            },
+        )
+    }
+
+    #[test]
+    fn only_own_zone_and_new_stop_after_leaving() {
+        let mut rule = rule();
+        let track = Uuid::new_v4();
+
+        for time in [0.0, 0.5, 1.0, 1.5] {
+            assert!(
+                rule.process(&observation(
+                    track,
+                    time,
+                    50.0,
+                    50.0,
+                    Some("zone-a"),
+                    Some(0.0)
+                ))
+                .is_empty(),
+                "time {time}"
+            );
+        }
+        assert_eq!(
+            rule.process(&observation(
+                track,
+                2.0,
+                50.0,
+                50.0,
+                Some("zone-a"),
+                Some(0.0)
+            ))
+            .len(),
+            1
+        );
+        // Still stationary in the same stop: suppressed.
+        assert!(
+            rule.process(&observation(
+                track,
+                2.1,
+                50.0,
+                50.0,
+                Some("zone-a"),
+                Some(0.0)
+            ))
+            .is_empty()
+        );
+        // Another zone, even with a point inside this rule's polygon, clears
+        // the state instead of keeping the fired flag alive.
+        assert!(
+            rule.process(&observation(
+                track,
+                2.2,
+                50.0,
+                50.0,
+                Some("zone-b"),
+                Some(0.0)
+            ))
+            .is_empty()
+        );
+
+        // A later stop in the own zone is a new event.
+        for (time, expected) in [(2.3, 0), (2.8, 0), (3.3, 0), (3.8, 0), (4.4, 1)] {
+            let events = rule.process(&observation(
+                track,
+                time,
+                50.0,
+                50.0,
+                Some("zone-a"),
+                Some(0.0),
+            ));
+            assert_eq!(events.len(), expected, "time {time}");
+        }
+    }
+
+    #[test]
+    fn a_long_observation_gap_restarts_the_timer() {
+        let mut rule = rule();
+        let track = Uuid::new_v4();
+
+        for time in [0.0, 0.5] {
+            assert!(
+                rule.process(&observation(
+                    track,
+                    time,
+                    50.0,
+                    50.0,
+                    Some("zone-a"),
+                    Some(0.0)
+                ))
+                .is_empty(),
+                "time {time}"
+            );
+        }
+        // The track disappears for 4.5 s. The next observation must start a
+        // new stationary period rather than inherit the old entered_at.
+        for (time, expected) in [(5.0, 0), (5.5, 0), (6.0, 0), (6.5, 0), (7.0, 1)] {
+            let events = rule.process(&observation(
+                track,
+                time,
+                50.0,
+                50.0,
+                Some("zone-a"),
+                Some(0.0),
+            ));
+            assert_eq!(events.len(), expected, "time {time}");
+        }
     }
 }

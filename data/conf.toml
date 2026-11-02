@@ -90,8 +90,6 @@
     id = "1e23985f-1fa3-45d0-a365-2d8525a23ddd"
 
 
-
-
 [violations]
 enabled = true
 state_ttl_sec = 7.0
@@ -123,6 +121,12 @@ cleanup_interval_sec = 1.0
     [road_lanes.rules.solid_line]
     line = [[254, 456], [456, 475]]
     margin_px = 8.0
+
+    [road_lanes.rules.speeding]
+    threshold_kmh = 30
+
+    [road_lanes.rules.wrong_way]
+
 
 
 [[road_lanes]]
