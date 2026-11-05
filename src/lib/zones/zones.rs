@@ -7,8 +7,7 @@ use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use geometry::PointsOrientation;
-use geometry::{get_orientation, is_intersects, is_on_segment};
+use geometry::{is_intersects, polygon_contains_point};
 
 use geojson::{
     GeoPolygon, SolidLineFeature, VirtualLineFeature, ZoneFeature, ZonePropertiesGeoJSON,
@@ -495,64 +494,11 @@ impl Zone {
         // self.statistics.traffic_flow_parameters.avg_speed = self.statistics.vehicles_data.values().map(|vt_param| vt_param.sum_intensity).sum::<u32>();
         self.reset_objects_registered();
     }
-    // Checks if given polygon contains a point
-    // Code has been taken from: https://github.com/LdDl/odam/blob/master/virtual_polygons.go#L180
+    // Checks if given polygon contains a point.
+    // Delegates to the canonical `polygon_contains_point` so that zone matching
+    // and the violation rules classify a point identically.
     pub fn contains_point(&self, x: f32, y: f32) -> bool {
-        let n = self.pixel_coordinates.len();
-        if n < 3 {
-            return false;
-        }
-        // @todo: math.maxInt could lead to overflow obviously. Need good workaround. PRs are welcome
-        let extreme_point: [f32; 2] = [99999.0, y];
-        let mut intersections_cnt = 0;
-        let mut previous = 0;
-        loop {
-            let current = (previous + 1) % n;
-            // Check if the segment from given point P to extreme point intersects with the segment from polygon point on previous interation to  polygon point on current interation
-            if is_intersects(
-                self.pixel_coordinates[previous].x as f32,
-                self.pixel_coordinates[previous].y as f32,
-                self.pixel_coordinates[current].x as f32,
-                self.pixel_coordinates[current].y as f32,
-                x,
-                y,
-                extreme_point[0],
-                extreme_point[1],
-            ) {
-                let orientation = get_orientation(
-                    self.pixel_coordinates[previous].x as f32,
-                    self.pixel_coordinates[previous].y as f32,
-                    x,
-                    y,
-                    self.pixel_coordinates[current].x as f32,
-                    self.pixel_coordinates[current].y as f32,
-                );
-                // If given point P is collinear with segment from polygon point on previous interation to  polygon point on current interation
-                if orientation == PointsOrientation::Collinear {
-                    // then check if it is on segment
-                    // 'True' will be returns if it lies on segment. Otherwise 'False' will be returned
-                    return is_on_segment(
-                        self.pixel_coordinates[previous].x as f32,
-                        self.pixel_coordinates[previous].y as f32,
-                        x,
-                        y,
-                        self.pixel_coordinates[current].x as f32,
-                        self.pixel_coordinates[current].y as f32,
-                    );
-                }
-                intersections_cnt += 1;
-            }
-            previous = current;
-            if previous == 0 {
-                break;
-            }
-        }
-        // If ray intersects even number of times then return true
-        // Otherwise return false
-        if intersections_cnt % 2 == 1 {
-            return true;
-        }
-        false
+        polygon_contains_point(&self.pixel_coordinates, x, y)
     }
     pub fn contains_point_cv(&self, pt: &Point2f) -> bool {
         self.contains_point(pt.x, pt.y)
