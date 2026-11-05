@@ -285,15 +285,24 @@ impl SolidLineIndex {
 
     /// Indices of lines whose expanded AABB may touch the query box.
     pub fn candidates(&self, query: &Aabb) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.candidates_into(query, &mut out);
+        out
+    }
+
+    /// Same as `candidates`, but appends to a caller-provided buffer so a
+    /// caller that queries many boxes per frame reuses the allocation.
+    pub fn candidates_into(&self, query: &Aabb, out: &mut Vec<usize>) {
+        out.clear();
         if !query.is_finite() {
-            return Vec::new();
+            return;
         }
 
         let Some((min_cx, max_cx)) = cell_range(query.min_x, query.max_x, self.cell_size) else {
-            return Vec::new();
+            return;
         };
         let Some((min_cy, max_cy)) = cell_range(query.min_y, query.max_y, self.cell_size) else {
-            return Vec::new();
+            return;
         };
 
         let span_x = (max_cx - min_cx) as i64 + 1;
@@ -303,10 +312,10 @@ impl SolidLineIndex {
             || span_x.saturating_mul(span_y) > MAX_CELLS_PER_QUERY as i64
         {
             // A gigantic query is cheaper to answer by looking at everything.
-            return (0..self.line_count).collect();
+            out.extend(0..self.line_count);
+            return;
         }
 
-        let mut out = Vec::new();
         for cx in min_cx..=max_cx {
             for cy in min_cy..=max_cy {
                 if let Some(bucket) = self.cells.get(&(cx, cy)) {
@@ -317,7 +326,6 @@ impl SolidLineIndex {
         out.extend_from_slice(&self.large);
         out.sort_unstable();
         out.dedup();
-        out
     }
 }
 
@@ -356,9 +364,17 @@ struct TrackState {
 /// once; line changes reset the state of that line, and stale entries are
 /// removed after `state_ttl_sec`.
 pub struct SolidLineDetector {
-    tracks: HashMap<(String, Uuid), TrackState>,
+    /// Crossing state per line, then per track. Two levels keep the hot path
+    /// free of String allocations: lookups use `&str`, and the line id is
+    /// cloned only when a line is seen for the first time.
+    tracks: HashMap<String, HashMap<Uuid, TrackState>>,
     last_centers: HashMap<Uuid, (PointPx, f32)>,
     line_signatures: HashMap<String, LineSignature>,
+    /// Bucket grid over the current lines. Rebuilt only when the line set or
+    /// its geometry changes, not on every frame.
+    index: SolidLineIndex,
+    /// Reused across candidate queries within a frame.
+    scratch: Vec<usize>,
     state_ttl_sec: f32,
     cleanup_interval_sec: f32,
     next_cleanup_at: f32,
@@ -380,6 +396,8 @@ impl SolidLineDetector {
             tracks: HashMap::new(),
             last_centers: HashMap::new(),
             line_signatures: HashMap::new(),
+            index: SolidLineIndex::new(&[]),
+            scratch: Vec::new(),
             state_ttl_sec,
             cleanup_interval_sec,
             next_cleanup_at: 0.0,
@@ -389,20 +407,26 @@ impl SolidLineDetector {
     /// Evaluates every line against every observation of one frame.
     ///
     /// The returned events belong to the frame; the caller publishes them.
-    pub fn process_frame(
+    ///
+    /// Generic over the observation container so a caller that shares one
+    /// observation between consumers can pass `&[Arc<TrackObservation>]`
+    /// while unit tests keep passing `&[TrackObservation]`.
+    pub fn process_frame<T>(
         &mut self,
         lines: &[SolidLineDefinition],
-        observations: &[TrackObservation],
-    ) -> Vec<ViolationEvent> {
+        observations: &[T],
+    ) -> Vec<ViolationEvent>
+    where
+        T: std::borrow::Borrow<TrackObservation>,
+    {
         self.refresh_lines(lines);
         if observations.is_empty() {
             return Vec::new();
         }
 
-        let index = SolidLineIndex::new(lines);
         let now = observations
             .iter()
-            .map(|obs| obs.source_time_relative_sec)
+            .map(|obs| obs.borrow().source_time_relative_sec)
             .filter(|time| time.is_finite())
             .fold(f32::NEG_INFINITY, f32::max);
         if now.is_finite() {
@@ -411,6 +435,7 @@ impl SolidLineDetector {
 
         let mut events = Vec::new();
         for obs in observations {
+            let obs = obs.borrow();
             let now = obs.source_time_relative_sec;
             if !now.is_finite() {
                 continue;
@@ -431,11 +456,15 @@ impl SolidLineDetector {
                 None => bbox,
             };
 
-            for line_index in index.candidates(&query) {
+            self.index.candidates_into(&query, &mut self.scratch);
+            let mut scratch_index = 0;
+            while scratch_index < self.scratch.len() {
+                let line_index = self.scratch[scratch_index];
                 let line = &lines[line_index];
                 if let Some(event) = self.process_line(line, obs, &center, now) {
                     events.push(event);
                 }
+                scratch_index += 1;
             }
 
             self.last_centers.insert(obs.track_id, (center, now));
@@ -446,19 +475,32 @@ impl SolidLineDetector {
     /// Drops state for lines that disappeared or changed geometry. Without
     /// this, moving a line under a track that already crossed it could either
     /// suppress a real crossing or fire one that never happened.
+    ///
+    /// The common case is checked without allocations: the ids and signatures
+    /// of the incoming lines are compared against the stored ones by borrowing
+    /// their keys. The map is rebuilt only when something actually changed.
     fn refresh_lines(&mut self, lines: &[SolidLineDefinition]) {
+        let unchanged = self.line_signatures.len() == lines.len()
+            && lines.iter().all(|line| {
+                self.line_signatures.get(line.id.as_str()) == Some(&line.signature())
+            });
+        if unchanged {
+            return;
+        }
+
         let current: HashMap<String, LineSignature> = lines
             .iter()
             .map(|line| (line.id.clone(), line.signature()))
             .collect();
 
         let previous = &self.line_signatures;
-        self.tracks.retain(|(line_id, _), _| {
+        self.tracks.retain(|line_id, _| {
             current
                 .get(line_id)
                 .is_some_and(|signature| previous.get(line_id) == Some(signature))
         });
         self.line_signatures = current;
+        self.index = SolidLineIndex::new(lines);
     }
 
     fn cleanup_if_needed(&mut self, now: f32) {
@@ -467,10 +509,13 @@ impl SolidLineDetector {
         }
 
         let ttl = self.state_ttl_sec;
-        self.tracks.retain(|_, state| {
-            let age = now - state.last_seen_at;
-            age >= 0.0 && age <= ttl
-        });
+        for by_track in self.tracks.values_mut() {
+            by_track.retain(|_, state| {
+                let age = now - state.last_seen_at;
+                age >= 0.0 && age <= ttl
+            });
+        }
+        self.tracks.retain(|_, by_track| !by_track.is_empty());
         self.last_centers.retain(|_, (_, seen_at)| {
             let age = now - *seen_at;
             age >= 0.0 && age <= ttl
@@ -489,24 +534,35 @@ impl SolidLineDetector {
             return None;
         }
 
-        let key = (line.id.clone(), obs.track_id);
-        if let Some(state) = self.tracks.get(&key) {
-            let age = now - state.last_seen_at;
-            if age < 0.0 || age > self.state_ttl_sec {
-                self.tracks.remove(&key);
-            }
-        }
-
         let side = line.classify_side(center);
         let touches = line.intersects_bbox(&obs.bbox);
         let (line_start, line_end) = line.endpoints();
 
-        let state = self.tracks.entry(key).or_insert_with(|| TrackState {
-            last_non_neutral_center: center.clone(),
-            last_non_neutral_side: side,
-            last_seen_at: now,
-            fired: false,
-        });
+        let expired = self
+            .tracks
+            .get(line.id.as_str())
+            .and_then(|by_track| by_track.get(&obs.track_id))
+            .map_or(false, |state| {
+                let age = now - state.last_seen_at;
+                age < 0.0 || age > self.state_ttl_sec
+            });
+        if expired {
+            if let Some(by_track) = self.tracks.get_mut(line.id.as_str()) {
+                by_track.remove(&obs.track_id);
+            }
+        }
+
+        let state = self
+            .tracks
+            .entry(line.id.clone())
+            .or_default()
+            .entry(obs.track_id)
+            .or_insert_with(|| TrackState {
+                last_non_neutral_center: center.clone(),
+                last_non_neutral_side: side,
+                last_seen_at: now,
+                fired: false,
+            });
         state.last_seen_at = now;
 
         if state.fired {
@@ -547,7 +603,7 @@ impl SolidLineDetector {
     /// Test hook: how many `(line, track)` states are alive right now.
     #[cfg(test)]
     fn state_count(&self) -> usize {
-        self.tracks.len()
+        self.tracks.values().map(|by_track| by_track.len()).sum()
     }
 }
 

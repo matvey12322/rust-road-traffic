@@ -7,6 +7,7 @@ pub mod detection;
 pub mod draw;
 pub mod logging;
 pub mod mjpeg_streaming;
+pub mod perf_stages;
 pub mod perf_stats;
 pub mod ocr_fusion;
 pub mod publisher;

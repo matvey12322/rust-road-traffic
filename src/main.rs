@@ -17,11 +17,12 @@ use lib::detection::Detector;
 use lib::detection::KalmanFilterType;
 use lib::draw;
 use lib::logging;
+use lib::perf_stages::PerfStages;
 use lib::perf_stats::{PerfStats, Timer};
 use lib::publisher::RedisPublishers;
 use lib::status::{DetectionStatus, InputStatus, RuntimeStatus};
 use lib::track_observations::{
-    spawn_console_observer, BoundingBoxPx, PointProjected, PointPx, TrackObservation, TrackObservations,
+    BoundingBoxPx, PointProjected, PointPx, TrackObservation, TrackObservations,
 };
 use lib::tracker::{new_tracker_from_type, SpatialInfo, TrackerTrait};
 use lib::vehicle_events::VehicleEventCollector;
@@ -57,8 +58,8 @@ fn get_sys_time_in_secs() -> u64 {
     }
 }
 
-fn publish_track_observation(tx: &TrackObservations, observation: TrackObservation) {
-    let _ = tx.send(Arc::new(observation));
+fn publish_track_observation(tx: &TrackObservations, observation: Arc<TrackObservation>) {
+    let _ = tx.send(observation);
 }
 
 #[derive(Debug)]
@@ -240,7 +241,6 @@ fn run(
     let (tx_mjpeg, rx_mjpeg) = mpsc::sync_channel(0);
     let (vehicle_events, _) = tokio::sync::broadcast::channel(128);
     let track_observations: TrackObservations = tokio::sync::broadcast::channel(1024).0;
-    let _track_observer_task = spawn_console_observer(&track_observations);
     let _violation_observer_task = violations::spawn_violation_observer(
         &track_observations,
         settings.violations.clone(),
@@ -474,6 +474,9 @@ fn run(
         None
     };
 
+    // Temporary per-stage timing, compiled only with --cfg perf_stages.
+    let mut perf_stages = PerfStages::new();
+
     /* JPEG encoder for MJPEG streaming (reused across frames) */
     let mut jpeg_encoder = if enable_mjpeg {
         Some(lib::mjpeg_streaming::JpegEncoder::new(
@@ -492,6 +495,7 @@ fn run(
     const VEHICLE_ZONE_MAP_PRUNE_INTERVAL: u32 = 300;
     let mut frames_since_vehicle_map_prune: u32 = 0;
     while let Some(received) = rx_capture.recv() {
+        perf_stages.begin_frame();
         let observed_at = Utc::now();
         if report_mode && first_frame.is_none() {
             first_frame = Some(received.frame.clone());
@@ -500,6 +504,7 @@ fn run(
         // Note: frame clone is deferred to only displaying
 
         /* Inference (preprocessing + forward pass + NMS) */
+        perf_stages.stage("inference");
         let t_inference = Timer::start();
         let (nms_bboxes, nms_classes_ids, nms_confidences) = match detector.detect_frame(
             &received.frame,
@@ -528,6 +533,7 @@ fn run(
             }
             _ => nominal_dt,
         };
+        perf_stages.stage("postprocess");
         let t_postprocess = Timer::start();
         let mut tmp_detections = process_yolo_detections(
             &nms_bboxes,
@@ -544,6 +550,7 @@ fn run(
         let postprocess_time = t_postprocess.elapsed();
 
         /* Tracking: match detections to existing tracks */
+        perf_stages.stage("tracking");
         let t_tracking = Timer::start();
         let relative_time = received.timestamp as f32;
         match tracker.match_objects(&mut tmp_detections, relative_time, dt as f32) {
@@ -618,6 +625,7 @@ fn run(
             }
         }
 
+        perf_stages.stage("locks");
         let ds_guard = ds_tracker.read().expect("DataStorage is poisoned [RWLock]");
         let zones = ds_guard
             .zones
@@ -631,6 +639,7 @@ fn run(
         // Lines are read from the running zones, not from the settings this
         // process started with: moving a line through the REST API must take
         // effect on the next frame, without a restart.
+        perf_stages.stage("solid_lines_collect");
         let solid_lines: Vec<SolidLineDefinition> = if settings.violations.enabled {
             zones
                 .iter()
@@ -645,6 +654,7 @@ fn run(
             Vec::new()
         };
 
+        perf_stages.stage("observe_detections");
         if let Some(collector) = event_collector.as_mut() {
             collector.observe_detections(
                 &tmp_detections,
@@ -655,6 +665,7 @@ fn run(
         }
 
         // Reset current occupancy for zones
+        perf_stages.stage("occupancy_reset");
         let current_ut = get_sys_time_in_secs();
         for (_, zone_guarded) in zones.iter() {
             let mut zone = zone_guarded.lock().expect("Zone is poisoned [Mutex]");
@@ -665,6 +676,7 @@ fn run(
         }
 
         // Zero-copy filtering: collect IDs of active objects
+        perf_stages.stage("per_track");
         let object_ids: Vec<Uuid> = tracker
             .iter_tracked_objects()
             .filter_map(|(id, obj)| if obj.get_no_match_times() <= 1 { Some(id) } else { None })
@@ -673,7 +685,10 @@ fn run(
         // One observation per active track for the global solid-line detector.
         // Unlike the per-zone observations below, these are produced whether or
         // not the track is inside any zone.
-        let mut global_observations: Vec<TrackObservation> = Vec::with_capacity(object_ids.len());
+        let mut global_observations: Vec<Arc<TrackObservation>> =
+            Vec::with_capacity(object_ids.len());
+        let mut zone_obs_published: u64 = 0;
+        perf_stages.count("active_tracks", object_ids.len() as u64);
 
         for object_id in object_ids {
             let (last_point_x, last_point_y, last_before_point, no_match_times, bbox) = {
@@ -811,33 +826,6 @@ fn run(
                             zone_id_from.clone(),
                         );
 
-                        publish_track_observation(
-                            &track_observations,
-                            TrackObservation {
-                                equipment_id: ds_guard.id.clone(),
-                                track_id: object_id,
-                                observed_at,
-                                source_time_relative_sec: relative_time,
-                                class_name: class_name.clone(),
-                                confidence: detection_confidence,
-                                bbox: bbox_px.clone(),
-                                anchor_px: anchor_px.clone(),
-                                image_point_px: PointPx {
-                                    x: last_point_x,
-                                    y: last_point_y,
-                                },
-                                projected_point: Some(PointProjected {
-                                    x: projected_pt.0,
-                                    y: projected_pt.1,
-                                }),
-                                speed_kmh,
-                                zone_id: Some(zone.id.clone()),
-                                previous_zone_id: previous_zone_id.clone(),
-                                crossed_virtual_line: crossed,
-                                no_match_times,
-                            },
-                        );
-
                         counted_in_zone
                     }
                     None => {
@@ -857,33 +845,6 @@ fn run(
                             class_name.clone(),
                             crossed,
                             zone_id_from.clone(),
-                        );
-
-                        publish_track_observation(
-                            &track_observations,
-                            TrackObservation {
-                                equipment_id: ds_guard.id.clone(),
-                                track_id: object_id,
-                                observed_at,
-                                source_time_relative_sec: relative_time,
-                                class_name: class_name.clone(),
-                                confidence: detection_confidence,
-                                bbox: bbox_px.clone(),
-                                anchor_px: anchor_px.clone(),
-                                image_point_px: PointPx {
-                                    x: last_point_x,
-                                    y: last_point_y,
-                                },
-                                projected_point: Some(PointProjected {
-                                    x: projected_pt.0,
-                                    y: projected_pt.1,
-                                }),
-                                speed_kmh: None,
-                                zone_id: Some(zone.id.clone()),
-                                previous_zone_id: previous_zone_id.clone(),
-                                crossed_virtual_line: crossed,
-                                no_match_times,
-                            },
                         );
 
                         counted_in_zone
@@ -906,16 +867,22 @@ fn run(
                 break;
             }
 
-            if settings.violations.enabled {
-                global_observations.push(TrackObservation {
+            // One observation per track, built once and shared between the
+            // violation observer (broadcast, in-zone tracks only, as before)
+            // and the global solid-line detector (every track, when
+            // violations are enabled). A single construction halves the
+            // per-frame String clones this used to cost.
+            let in_zone = matched_zone_id.is_some();
+            if in_zone || settings.violations.enabled {
+                let observation = Arc::new(TrackObservation {
                     equipment_id: ds_guard.id.clone(),
                     track_id: object_id,
                     observed_at,
                     source_time_relative_sec: relative_time,
-                    class_name: class_name.clone(),
+                    class_name,
                     confidence: detection_confidence,
-                    bbox: bbox_px.clone(),
-                    anchor_px: anchor_px.clone(),
+                    bbox: bbox_px,
+                    anchor_px,
                     image_point_px: PointPx {
                         x: last_point_x,
                         y: last_point_y,
@@ -923,19 +890,30 @@ fn run(
                     projected_point: matched_projected_point,
                     speed_kmh: matched_speed_kmh,
                     zone_id: matched_zone_id,
-                    previous_zone_id: previous_zone_id.clone(),
+                    previous_zone_id,
                     crossed_virtual_line: matched_crossed_virtual_line,
                     no_match_times,
                 });
+                if in_zone {
+                    publish_track_observation(&track_observations, Arc::clone(&observation));
+                    zone_obs_published += 1;
+                }
+                if settings.violations.enabled {
+                    global_observations.push(observation);
+                }
             }
         }
 
         if settings.violations.enabled {
+            perf_stages.stage("solid_line_detect");
             let events = solid_line_detector.process_frame(&solid_lines, &global_observations);
+            perf_stages.count("solid_line_events", events.len() as u64);
             for event in events {
                 solid_line_sink.publish(&event);
             }
         }
+        perf_stages.count("global_obs", global_observations.len() as u64);
+        perf_stages.count("zone_obs", zone_obs_published);
 
         frames_since_vehicle_map_prune += 1;
         if frames_since_vehicle_map_prune >= VEHICLE_ZONE_MAP_PRUNE_INTERVAL {
@@ -957,6 +935,7 @@ fn run(
             // Sleep for a while for debug
             // thread::sleep(std::time::Duration::from_millis(500));
 
+            perf_stages.stage("mjpeg_draw");
             let mut frame = received.frame.clone();
 
             for (_, v) in zones.iter() {
@@ -974,8 +953,10 @@ fn run(
             drop(ds_guard);
             draw::draw_track(&mut frame, tracker, &class_colors);
 
+            perf_stages.stage("mjpeg_encode");
             match jpeg_encoder.as_mut().unwrap().encode(frame.data_bytes()) {
                 Ok(jpeg_buf) => {
+                    perf_stages.stage("mjpeg_send");
                     match tx_mjpeg.send(jpeg_buf) {
                         Ok(_) => {}
                         Err(err) => {
@@ -994,6 +975,7 @@ fn run(
             drop(ds_guard);
         }
 
+        perf_stages.stage("tail");
         if let (Some(collector), Some(models)) =
             (event_collector.as_mut(), plate_models.as_deref_mut())
         {
@@ -1007,6 +989,7 @@ fn run(
                 .clone();
             collector.publish_completed(tracker, &equipment_id, plate_models.as_deref_mut());
         }
+        perf_stages.end_frame();
     }
 
     if report_mode {

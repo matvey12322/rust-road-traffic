@@ -2,8 +2,6 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
-use tracing::{info, warn};
 use uuid::Uuid;
 
 /// Broadcast sender used to share track observations between consumers.
@@ -81,48 +79,12 @@ pub struct TrackObservation {
 
 /// Subscribes to track observations and starts an asynchronous consumer.
 ///
-/// Each received observation is serialized to JSON. The current success
-/// branch intentionally performs no output, so this function does not
-/// log observation payloads despite its name.
-///
-/// Logs serialization failures, warns when observations are skipped
-/// because the receiver falls behind, and exits when the channel is
-/// closed and all buffered messages have been consumed.
-/// Returns the spawned task's join handle.
-pub fn spawn_console_observer(tx: &TrackObservations) -> JoinHandle<()> {
-    let mut rx: TrackObservationRx = tx.subscribe();
-
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(obs) => match serde_json::to_string(&*obs) {
-                    Ok(json) => {}
-                    Err(err) => {
-                        warn!(
-                            target: "track_observation",
-                            error = %err,
-                            "Failed to serialize track observation"
-                        );
-                    }
-                },
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(
-                        target: "track_observation",
-                        skipped,
-                        "Track observation consumer lagged behind"
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    info!(
-                        target: "track_observation",
-                        "Track observation channel closed"
-                    );
-                    break;
-                }
-            }
-        }
-    })
-}
+/// Each received observation was serialized to JSON here, but the success
+/// branch performed no output, so the serialization was pure waste: every
+/// zone observation was encoded and then discarded. The only consumer left
+/// is the violation observer in `violations::spawn_violation_observer`;
+/// nothing else needs to be spawned for console output until there is
+/// actually something to print.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
