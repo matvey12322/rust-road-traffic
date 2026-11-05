@@ -981,7 +981,11 @@ async fn main() {
         impl Drop for FlamegraphGuard {
             fn drop(&mut self) {
                 match self.0.report().build() {
-                    Ok(report) => match std::fs::File::create("flamegraph.svg") {
+                    Ok(report) => {
+                        // exact stacks and counts: one line per stack
+                        let stacks = format!("{report:?}");
+                        let _ = std::fs::write("flamegraph.stacks.txt", stacks);
+                        match std::fs::File::create("flamegraph.svg") {
                         Ok(file) => {
                             if let Err(err) = report.flamegraph(file) {
                                 eprintln!("flamegraph write failed: {err}");
@@ -990,7 +994,8 @@ async fn main() {
                             }
                         }
                         Err(err) => eprintln!("can't create flamegraph.svg: {err}"),
-                    },
+                        }
+                    }
                     Err(err) => eprintln!("flamegraph report failed: {err}"),
                 }
             }
