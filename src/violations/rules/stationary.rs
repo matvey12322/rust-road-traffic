@@ -9,8 +9,8 @@ use crate::lib::zones::geometry::polygon_contains_point;
 use crate::settings::LaneZoneViolationRuleSettings;
 use crate::violations::coordinator::RuleRuntimeConfig;
 use crate::violations::event::ViolationEvent;
-use crate::violations::rules::state::{RuleStateStore, TrackStateEntry};
 use crate::violations::rules::ViolationRule;
+use crate::violations::rules::state::{RuleStateStore, TrackStateEntry};
 
 /// A stationary period must be observed continuously. A longer gap means the
 /// track was not visible and the timer restarts.
@@ -212,9 +212,9 @@ impl StationaryZoneRule {
 mod tests {
     use super::*;
     use crate::lib::track_observations::test_support::observation;
-    use uuid::Uuid;
     use crate::settings::LaneZoneViolationRuleSettings;
     use crate::violations::coordinator::RuleRuntimeConfig;
+    use uuid::Uuid;
 
     const KINDS: [StationaryRuleKind; 2] = [
         StationaryRuleKind::NoParking,

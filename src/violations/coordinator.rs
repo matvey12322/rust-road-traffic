@@ -7,10 +7,10 @@ use crate::lib::track_observations::TrackObservation;
 use crate::lib::zones::zones::Zone;
 use crate::settings::ViolationsSettings;
 use crate::violations::event::ViolationEvent;
+use crate::violations::rules::ViolationRule;
 use crate::violations::rules::speeding::SpeedingRule;
 use crate::violations::rules::stationary::{StationaryRuleKind, StationaryZoneRule};
 use crate::violations::rules::wrong_way::WrongWayRule;
-use crate::violations::rules::ViolationRule;
 use crate::violations::solid_line::{SolidLineDefinition, SolidLineRule};
 
 #[derive(Debug, Clone, Copy)]
@@ -168,18 +168,18 @@ fn build_rules_for_zone(zone: &Zone, runtime: &RuleRuntimeConfig) -> Vec<Box<dyn
         )));
     }
 
-    if let Some(rule) = &rules.wrong_way
-        && let Some(virtual_line) = zone.get_virtual_line()
-        && let Some(allowed_direction) =
+    if let Some(rule) = &rules.wrong_way {
+        if let Some(allowed_direction) = zone.get_virtual_line().and_then(|virtual_line| {
             allowed_direction_from_virtual_line(virtual_line.line, virtual_line.direction)
-    {
-        out.push(Box::new(WrongWayRule::from_embedded(
-            zone_id.clone(),
-            geometry.clone(),
-            allowed_direction,
-            rule.min_direction_samples,
-            *runtime,
-        )));
+        }) {
+            out.push(Box::new(WrongWayRule::from_embedded(
+                zone_id.clone(),
+                geometry.clone(),
+                allowed_direction,
+                rule.min_direction_samples,
+                *runtime,
+            )));
+        }
     }
 
     if let Some(solid_line) = zone.get_solid_line().filter(|line| line.is_valid()) {
@@ -283,16 +283,18 @@ mod tests {
             1
         );
         // The same episode is suppressed.
-        assert!(coordinator
-            .process_frame(&[observation(
-                track,
-                1.1,
-                50.0,
-                50.0,
-                Some("zone-1"),
-                Some(60.0)
-            )])
-            .is_empty());
+        assert!(
+            coordinator
+                .process_frame(&[observation(
+                    track,
+                    1.1,
+                    50.0,
+                    50.0,
+                    Some("zone-1"),
+                    Some(60.0)
+                )])
+                .is_empty()
+        );
 
         // The zone is moved through the API path: the polygon no longer
         // covers (50, 50). The rules must follow on the next frame, without a
@@ -308,16 +310,18 @@ mod tests {
             zone.update_pixel_map([[200, 200], [300, 200], [300, 300], [200, 300]]);
         }
         let other = Uuid::new_v4();
-        assert!(coordinator
-            .process_frame(&[observation(
-                other,
-                2.0,
-                50.0,
-                50.0,
-                Some("zone-1"),
-                Some(60.0)
-            )])
-            .is_empty());
+        assert!(
+            coordinator
+                .process_frame(&[observation(
+                    other,
+                    2.0,
+                    50.0,
+                    50.0,
+                    Some("zone-1"),
+                    Some(60.0)
+                )])
+                .is_empty()
+        );
 
         // A point inside the new polygon fires again.
         assert_eq!(
@@ -357,16 +361,18 @@ mod tests {
         let track = Uuid::new_v4();
 
         // No rules configured: nothing fires.
-        assert!(coordinator
-            .process_frame(&[observation(
-                track,
-                1.0,
-                50.0,
-                50.0,
-                Some("zone-1"),
-                Some(60.0)
-            )])
-            .is_empty());
+        assert!(
+            coordinator
+                .process_frame(&[observation(
+                    track,
+                    1.0,
+                    50.0,
+                    50.0,
+                    Some("zone-1"),
+                    Some(60.0)
+                )])
+                .is_empty()
+        );
 
         // The zone gains a speeding rule while running.
         {

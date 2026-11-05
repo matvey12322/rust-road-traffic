@@ -4,8 +4,8 @@ use crate::lib::track_observations::TrackObservation;
 use crate::lib::zones::geometry::polygon_contains_point;
 use crate::violations::coordinator::RuleRuntimeConfig;
 use crate::violations::event::ViolationEvent;
-use crate::violations::rules::state::{RuleStateStore, TrackStateEntry};
 use crate::violations::rules::ViolationRule;
+use crate::violations::rules::state::{RuleStateStore, TrackStateEntry};
 
 #[derive(Debug, Clone)]
 struct TrackState {
@@ -198,9 +198,9 @@ impl WrongWayRule {
 mod tests {
     use super::*;
     use crate::lib::track_observations::test_support::observation;
-    use uuid::Uuid;
     use crate::violations::coordinator::RuleRuntimeConfig;
-        fn rule() -> WrongWayRule {
+    use uuid::Uuid;
+    fn rule() -> WrongWayRule {
         WrongWayRule::from_embedded(
             "zone-a".to_string(),
             vec![[0, 0], [100, 0], [100, 100], [0, 100]],
@@ -218,13 +218,15 @@ mod tests {
         let mut rule = rule();
         let track = Uuid::new_v4();
 
-        assert!(rule
-            .process_frame(&[observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None)])
-            .is_empty());
+        assert!(
+            rule.process_frame(&[observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None)])
+                .is_empty()
+        );
         // Second observation: two samples so far, threshold is three.
-        assert!(rule
-            .process_frame(&[observation(track, 1.0, 50.0, 60.0, Some("zone-a"), None)])
-            .is_empty());
+        assert!(
+            rule.process_frame(&[observation(track, 1.0, 50.0, 60.0, Some("zone-a"), None)])
+                .is_empty()
+        );
         // Third observation: movement from the first point is opposite to
         // the allowed [0, -1] direction.
         assert_eq!(
@@ -239,13 +241,14 @@ mod tests {
         let mut rule = rule();
         let track = Uuid::new_v4();
 
-        assert!(rule
-            .process_frame(&[observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None)])
-            .is_empty());
+        assert!(
+            rule.process_frame(&[observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None)])
+                .is_empty()
+        );
         assert_eq!(rule.tracks.len(), 1);
 
-        assert!(rule
-            .process_frame(&[observation(
+        assert!(
+            rule.process_frame(&[observation(
                 track,
                 f32::NAN,
                 50.0,
@@ -253,7 +256,8 @@ mod tests {
                 Some("zone-a"),
                 None
             )])
-            .is_empty());
+            .is_empty()
+        );
         assert_eq!(rule.tracks.len(), 1);
     }
 }

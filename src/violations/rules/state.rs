@@ -5,8 +5,8 @@
 //! most once per `cleanup_interval_sec`. This store is the one implementation
 //! of that bookkeeping; the rules only carry their domain state.
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use uuid::Uuid;
 
 /// What the store needs to know about a rule's state value: when the track
