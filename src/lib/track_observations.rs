@@ -7,10 +7,13 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 /// Broadcast sender used to share track observations between consumers.
-pub type TrackObservations = broadcast::Sender<Arc<TrackObservation>>;
+/// One message per frame carries the observations of every active track, so
+/// consumers evaluate rules on whole frames (the solid-line rule needs the
+/// frame batch) and the channel is not woken once per track.
+pub type TrackObservations = broadcast::Sender<Arc<Vec<TrackObservation>>>;
 
 /// Broadcast receiver used by an individual track observation consumer.
-pub type TrackObservationRx = broadcast::Receiver<Arc<TrackObservation>>;
+pub type TrackObservationRx = broadcast::Receiver<Arc<Vec<TrackObservation>>>;
 
 /// A snapshot of a tracked object's geometry, metadata, and zone context.
 #[derive(Debug, Clone, Serialize)]

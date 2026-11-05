@@ -67,6 +67,16 @@ impl SpeedingRule {
 }
 
 impl ViolationRule for SpeedingRule {
+    fn process_frame(&mut self, observations: &[TrackObservation]) -> Vec<ViolationEvent> {
+        let mut events = Vec::new();
+        for obs in observations {
+            events.extend(self.process(obs));
+        }
+        events
+    }
+}
+
+impl SpeedingRule {
     /// Processes a track observation and emits an event when its anchor
     /// is inside the configured polygon and its valid speed strictly
     /// exceeds the configured threshold.
@@ -154,63 +164,63 @@ mod tests {
         // Another zone must not create an event even if its point is inside
         // this rule's polygon.
         assert!(
-            rule.process(&observation(
+            rule.process_frame(&[observation(
                 track,
                 1.0,
                 50.0,
                 50.0,
                 Some("zone-b"),
                 Some(60.0)
-            ))
+            )])
             .is_empty()
         );
         // Own zone: first speeding event.
         assert_eq!(
-            rule.process(&observation(
+            rule.process_frame(&[observation(
                 track,
                 1.1,
                 50.0,
                 50.0,
                 Some("zone-a"),
                 Some(60.0)
-            ))
+            )])
             .len(),
             1
         );
         // Still speeding in the same episode: suppressed.
         assert!(
-            rule.process(&observation(
+            rule.process_frame(&[observation(
                 track,
                 1.2,
                 50.0,
                 50.0,
                 Some("zone-a"),
                 Some(60.0)
-            ))
+            )])
             .is_empty()
         );
         // Leaving the zone clears the deduplication record.
         assert!(
-            rule.process(&observation(
+            rule.process_frame(&[observation(
                 track,
                 1.3,
                 50.0,
                 50.0,
                 Some("zone-b"),
                 Some(60.0)
-            ))
+            )])
             .is_empty()
         );
         // A later visit to the own zone can report again.
         assert_eq!(
-            rule.process(&observation(
+            rule.process_frame(&[observation(
                 track,
                 1.4,
                 50.0,
                 50.0,
                 Some("zone-a"),
                 Some(60.0)
-            ))
+            )])
             .len(),
             1
         );

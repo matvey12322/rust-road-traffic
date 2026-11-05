@@ -109,6 +109,16 @@ impl WrongWayRule {
 }
 
 impl ViolationRule for WrongWayRule {
+    fn process_frame(&mut self, observations: &[TrackObservation]) -> Vec<ViolationEvent> {
+        let mut events = Vec::new();
+        for obs in observations {
+            events.extend(self.process(obs));
+        }
+        events
+    }
+}
+
+impl WrongWayRule {
     /// Processes an observation within the configured zone and polygon.
     /// Once the sample counter reaches the configured threshold, compares
     /// displacement from the first anchor to the current anchor with the
@@ -211,18 +221,18 @@ mod tests {
         let track = Uuid::new_v4();
 
         assert!(
-            rule.process(&observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None))
+            rule.process_frame(&[observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None)])
                 .is_empty()
         );
         // Second observation: two samples so far, threshold is three.
         assert!(
-            rule.process(&observation(track, 1.0, 50.0, 60.0, Some("zone-a"), None))
+            rule.process_frame(&[observation(track, 1.0, 50.0, 60.0, Some("zone-a"), None)])
                 .is_empty()
         );
         // Third observation: movement from the first point is opposite to
         // the allowed [0, -1] direction.
         assert_eq!(
-            rule.process(&observation(track, 2.0, 50.0, 70.0, Some("zone-a"), None))
+            rule.process_frame(&[observation(track, 2.0, 50.0, 70.0, Some("zone-a"), None)])
                 .len(),
             1
         );
@@ -234,20 +244,20 @@ mod tests {
         let track = Uuid::new_v4();
 
         assert!(
-            rule.process(&observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None))
+            rule.process_frame(&[observation(track, 0.0, 50.0, 50.0, Some("zone-a"), None)])
                 .is_empty()
         );
         assert_eq!(rule.tracks.len(), 1);
 
         assert!(
-            rule.process(&observation(
+            rule.process_frame(&[observation(
                 track,
                 f32::NAN,
                 50.0,
                 60.0,
                 Some("zone-a"),
                 None
-            ))
+            )])
             .is_empty()
         );
         assert_eq!(rule.tracks.len(), 1);

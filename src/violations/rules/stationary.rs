@@ -116,6 +116,16 @@ impl StationaryZoneRule {
 }
 
 impl ViolationRule for StationaryZoneRule {
+    fn process_frame(&mut self, observations: &[TrackObservation]) -> Vec<ViolationEvent> {
+        let mut events = Vec::new();
+        for obs in observations {
+            events.extend(self.process(obs));
+        }
+        events
+    }
+}
+
+impl StationaryZoneRule {
     /// Processes a track observation and emits an event once the track
     /// has remained inside the polygon at or below the stationary speed
     /// threshold for the configured duration.
@@ -234,54 +244,54 @@ mod tests {
 
             for time in [0.0, 0.5, 1.0, 1.5] {
                 assert!(
-                    rule.process(&observation(
+                    rule.process_frame(&[observation(
                         track,
                         time,
                         50.0,
                         50.0,
                         Some("zone-a"),
                         Some(0.0)
-                    ))
+                    )])
                     .is_empty(),
                     "{kind:?} time {time}"
                 );
             }
             assert_eq!(
-                rule.process(&observation(
+                rule.process_frame(&[observation(
                     track,
                     2.0,
                     50.0,
                     50.0,
                     Some("zone-a"),
                     Some(0.0)
-                ))
+                )])
                 .len(),
                 1,
                 "{kind:?}"
             );
             // Moving above the stationary threshold clears the fired state.
             assert!(
-                rule.process(&observation(
+                rule.process_frame(&[observation(
                     track,
                     2.1,
                     50.0,
                     50.0,
                     Some("zone-a"),
                     Some(20.0)
-                ))
+                )])
                 .is_empty(),
                 "{kind:?}"
             );
             // A later stop is reported again.
             for (time, expected) in [(2.3, 0), (2.8, 0), (3.3, 0), (3.8, 0), (4.4, 1)] {
-                let events = rule.process(&observation(
+                let events = rule.process_frame(&[observation(
                     track,
                     time,
                     50.0,
                     50.0,
                     Some("zone-a"),
                     Some(0.0),
-                ));
+                )]);
                 assert_eq!(events.len(), expected, "{kind:?} time {time}");
             }
         }
@@ -295,69 +305,69 @@ mod tests {
 
             for time in [0.0, 0.5, 1.0, 1.5] {
                 assert!(
-                    rule.process(&observation(
+                    rule.process_frame(&[observation(
                         track,
                         time,
                         50.0,
                         50.0,
                         Some("zone-a"),
                         Some(0.0)
-                    ))
+                    )])
                     .is_empty(),
                     "{kind:?} time {time}"
                 );
             }
             assert_eq!(
-                rule.process(&observation(
+                rule.process_frame(&[observation(
                     track,
                     2.0,
                     50.0,
                     50.0,
                     Some("zone-a"),
                     Some(0.0)
-                ))
+                )])
                 .len(),
                 1,
                 "{kind:?}"
             );
             // Still stationary in the same stop: suppressed.
             assert!(
-                rule.process(&observation(
+                rule.process_frame(&[observation(
                     track,
                     2.1,
                     50.0,
                     50.0,
                     Some("zone-a"),
                     Some(0.0)
-                ))
+                )])
                 .is_empty(),
                 "{kind:?}"
             );
             // Another zone, even with a point inside this rule's polygon, clears
             // the state instead of keeping the fired flag alive.
             assert!(
-                rule.process(&observation(
+                rule.process_frame(&[observation(
                     track,
                     2.2,
                     50.0,
                     50.0,
                     Some("zone-b"),
                     Some(0.0)
-                ))
+                )])
                 .is_empty(),
                 "{kind:?}"
             );
 
             // A later stop in the own zone is a new event.
             for (time, expected) in [(2.3, 0), (2.8, 0), (3.3, 0), (3.8, 0), (4.4, 1)] {
-                let events = rule.process(&observation(
+                let events = rule.process_frame(&[observation(
                     track,
                     time,
                     50.0,
                     50.0,
                     Some("zone-a"),
                     Some(0.0),
-                ));
+                )]);
                 assert_eq!(events.len(), expected, "{kind:?} time {time}");
             }
         }
@@ -371,14 +381,14 @@ mod tests {
 
             for time in [0.0, 0.5] {
                 assert!(
-                    rule.process(&observation(
+                    rule.process_frame(&[observation(
                         track,
                         time,
                         50.0,
                         50.0,
                         Some("zone-a"),
                         Some(0.0)
-                    ))
+                    )])
                     .is_empty(),
                     "{kind:?} time {time}"
                 );
@@ -386,14 +396,14 @@ mod tests {
             // The track disappears for 4.5 s. The next observation must start a
             // new stationary period rather than inherit the old entered_at.
             for (time, expected) in [(5.0, 0), (5.5, 0), (6.0, 0), (6.5, 0), (7.0, 1)] {
-                let events = rule.process(&observation(
+                let events = rule.process_frame(&[observation(
                     track,
                     time,
                     50.0,
                     50.0,
                     Some("zone-a"),
                     Some(0.0),
-                ));
+                )]);
                 assert_eq!(events.len(), expected, "{kind:?} time {time}");
             }
         }

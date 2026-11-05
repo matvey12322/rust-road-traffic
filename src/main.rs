@@ -8,7 +8,7 @@ use uuid::Uuid;
 #[path = "lib/mod.rs"]
 mod lib;
 use lib::anpr::plate_detector::PlateModels;
-use lib::data_storage::new_datastorage;
+use lib::data_storage::{new_datastorage, ThreadedDataStorage};
 use lib::dataset_collector::DatasetCollector;
 use lib::detection::process_yolo_detections;
 use lib::detection::DetectionBlobs::BBox;
@@ -32,9 +32,6 @@ mod settings;
 mod video_capture;
 mod violations;
 
-use violations::sink::{ConsoleSink, EventSink};
-use violations::solid_line::{SolidLineDefinition, SolidLineDetector};
-
 use settings::AppSettings;
 use video_capture::{frame_channel, kill_capture_subprocesses, ThreadedFrame, VideoSource};
 
@@ -55,10 +52,6 @@ fn get_sys_time_in_secs() -> u64 {
         Ok(n) => n.as_secs(),
         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
     }
-}
-
-fn publish_track_observation(tx: &TrackObservations, observation: Arc<TrackObservation>) {
-    let _ = tx.send(observation);
 }
 
 #[derive(Debug)]
@@ -116,6 +109,8 @@ fn run(
     tracker: &mut dyn TrackerTrait,
     detector: &mut Detector,
     mut plate_models: Option<&mut PlateModels>,
+    track_observations: TrackObservations,
+    data_storage: ThreadedDataStorage,
 ) -> Result<(), AppError> {
     let report_mode = settings.is_report_mode();
     if report_mode && !std::path::Path::new(&settings.input.video_src).is_file() {
@@ -146,8 +141,8 @@ fn run(
         "Run configuration"
     );
 
-    /* Preprocess spatial data */
-    let data_storage = new_datastorage(settings.equipment_info.id.clone());
+    /* Preprocess spatial data (the storage was created by main: the violation
+     * observer holds the same zones map this loop fills) */
     let target_classes = HashSet::from_iter(
         settings
             .detection
@@ -239,20 +234,6 @@ fn run(
     let overwrite_file = path_to_config.to_string();
     let (tx_mjpeg, rx_mjpeg) = mpsc::sync_channel(0);
     let (vehicle_events, _) = tokio::sync::broadcast::channel(128);
-    let track_observations: TrackObservations = tokio::sync::broadcast::channel(1024).0;
-    let _violation_observer_task = violations::spawn_violation_observer(
-        &track_observations,
-        settings.violations.clone(),
-        settings.road_lanes.clone().unwrap_or_default(),
-    );
-    // Solid lines are detected outside the zone observation stream: every
-    // active track is fed to this detector once per frame, so a line that lies
-    // outside any zone still catches a crossing.
-    let mut solid_line_detector = SolidLineDetector::new(
-        settings.violations.state_ttl_sec,
-        settings.violations.cleanup_interval_sec,
-    );
-    let solid_line_sink = ConsoleSink;
     let enable_vehicle_events = !report_mode
         && (settings.rest_api.enable || settings.redis_publisher.vehicle_events.enable);
     let mut event_collector = enable_vehicle_events.then(|| {
@@ -635,24 +616,6 @@ fn run(
             .read()
             .expect("Zone grid is poisoned [RWLock]");
 
-        // Lines are read from the running zones, not from the settings this
-        // process started with: moving a line through the REST API must take
-        // effect on the next frame, without a restart.
-        perf_stages.stage("solid_lines_collect");
-        let solid_lines: Vec<SolidLineDefinition> = if settings.violations.enabled {
-            zones
-                .iter()
-                .filter_map(|(zone_id, zone_guarded)| {
-                    let zone = zone_guarded.lock().expect("Zone is poisoned [Mutex]");
-                    zone.get_solid_line()
-                        .filter(|line| line.is_valid())
-                        .map(|line| SolidLineDefinition::from_zone(zone_id.clone(), line))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         perf_stages.stage("observe_detections");
         if let Some(collector) = event_collector.as_mut() {
             collector.observe_detections(
@@ -681,12 +644,11 @@ fn run(
             .filter_map(|(id, obj)| if obj.get_no_match_times() <= 1 { Some(id) } else { None })
             .collect();
 
-        // One observation per active track for the global solid-line detector.
-        // Unlike the per-zone observations below, these are produced whether or
-        // not the track is inside any zone.
-        let mut global_observations: Vec<Arc<TrackObservation>> =
+        // One observation per active track and frame for the violation rules.
+        // The batch is built only when violations are enabled, and published
+        // once per frame: the observer runs every rule on the whole frame.
+        let mut frame_observations: Vec<TrackObservation> =
             Vec::with_capacity(object_ids.len());
-        let mut zone_obs_published: u64 = 0;
         perf_stages.count("active_tracks", object_ids.len() as u64);
 
         for object_id in object_ids {
@@ -860,14 +822,10 @@ fn run(
                 break;
             }
 
-            // One observation per track, built once and shared between the
-            // violation observer (broadcast, in-zone tracks only, as before)
-            // and the global solid-line detector (every track, when
-            // violations are enabled). A single construction halves the
-            // per-frame String clones this used to cost.
-            let in_zone = matched_zone_id.is_some();
-            if in_zone || settings.violations.enabled {
-                let observation = Arc::new(TrackObservation {
+            // One observation per track, built once per frame and shared by
+            // every rule through the frame batch.
+            if settings.violations.enabled {
+                frame_observations.push(TrackObservation {
                     equipment_id: ds_guard.id.clone(),
                     track_id: object_id,
                     observed_at,
@@ -884,26 +842,14 @@ fn run(
                     crossed_virtual_line: matched_crossed_virtual_line,
                     no_match_times,
                 });
-                if in_zone {
-                    publish_track_observation(&track_observations, Arc::clone(&observation));
-                    zone_obs_published += 1;
-                }
-                if settings.violations.enabled {
-                    global_observations.push(observation);
-                }
             }
         }
 
-        if settings.violations.enabled {
-            perf_stages.stage("solid_line_detect");
-            let events = solid_line_detector.process_frame(&solid_lines, &global_observations);
-            perf_stages.count("solid_line_events", events.len() as u64);
-            for event in events {
-                solid_line_sink.publish(&event);
-            }
+        if settings.violations.enabled && !frame_observations.is_empty() {
+            perf_stages.stage("violation_publish");
+            perf_stages.count("frame_obs", frame_observations.len() as u64);
+            let _ = track_observations.send(Arc::new(frame_observations));
         }
-        perf_stages.count("global_obs", global_observations.len() as u64);
-        perf_stages.count("zone_obs", zone_obs_published);
 
         frames_since_vehicle_map_prune += 1;
         if frames_since_vehicle_map_prune >= VEHICLE_ZONE_MAP_PRUNE_INTERVAL {
@@ -1140,18 +1086,47 @@ async fn main() {
             std::process::exit(1);
         });
 
-    match run(
-        &app_settings,
-        path_to_config,
-        &mut *tracker,
-        &mut detector,
-        plate_models.as_mut(),
-    ) {
-        Ok(_) => {}
-        Err(err) => {
+    // Violation processing: one observer task on this runtime, fed by the
+    // detection thread through the observation broadcast. Spawned only when
+    // violations are enabled: the setting cannot change while running.
+    let track_observations: TrackObservations = tokio::sync::broadcast::channel(1024).0;
+    let data_storage = new_datastorage(app_settings.equipment_info.id.clone());
+    let _violation_observer_task = if app_settings.violations.enabled {
+        Some(violations::spawn_violation_observer(
+            &track_observations,
+            data_storage.clone(),
+            app_settings.violations.clone(),
+        ))
+    } else {
+        None
+    };
+
+    // The detection loop stays a dedicated OS thread, as in the baseline: it
+    // must never wait for this runtime's workers.
+    let path_to_config = path_to_config.to_string();
+    let run_thread = thread::spawn(move || {
+        run(
+            &app_settings,
+            &path_to_config,
+            &mut *tracker,
+            &mut detector,
+            plate_models.as_mut(),
+            track_observations,
+            data_storage,
+        )
+    });
+    match tokio::task::spawn_blocking(move || run_thread.join()).await {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(err))) => {
             error!(scope = logging::SCOPE_PROCESSING, error = %err, "Error in main thread");
         }
-    };
+        Ok(Err(_)) => {
+            error!(scope = logging::SCOPE_PROCESSING, "Detection thread panicked");
+        }
+        Err(err) => {
+            error!(scope = logging::SCOPE_PROCESSING, error = %err, "Can't wait for the detection thread");
+        }
+    }
     // A restart takes the capture subprocess down, which ends the run above:
     // stay alive until this process image is replaced
     lib::restart::wait_while_restarting();

@@ -1,16 +1,17 @@
-//! Solid-line crossing detection that does not depend on a track being inside
-//! a zone.
+//! Solid-line crossing detection as a violation rule.
 //!
 //! A solid line is configured inside a zone (`rules.solid_line`), but the
 //! vehicle that crosses it does not have to be inside that zone's polygon, or
-//! inside any zone at all. The detector is therefore fed every active track
-//! once per frame and owns its own, zone-independent, crossing state.
+//! inside any zone at all. The rule is therefore fed every observation of the
+//! frame and owns its own, zone-independent, crossing state.
 //!
-//! The search is a bucket grid over the line AABBs expanded by `margin_px`.
-//! For a track it is enough to inspect the cells its swept AABB touches,
-//! rather than testing every line against every box.
+//! One rule instance holds exactly one line, built by the coordinator from
+//! the live zone. When the line is moved through the REST API the coordinator
+//! replaces the rule, which resets that line's crossing state exactly like
+//! the per-line reset of the previous detector.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use uuid::Uuid;
 
@@ -21,18 +22,21 @@ use crate::lib::zones::geometry::{
     is_intersects, line_signed_distance, segment_intersection_point, segment_intersects_rect,
 };
 use crate::lib::zones::SolidLine;
-use crate::violations::event::{ViolationEvent, ViolationStatus};
+use crate::violations::coordinator::RuleRuntimeConfig;
+use crate::violations::event::ViolationEvent;
+use crate::violations::rules::state::{RuleStateStore, TrackStateEntry};
+use crate::violations::rules::ViolationRule;
 
-/// Side of a cell in the solid-line bucket grid, in pixels.
+/// Side of a cell in the solid-line bucket grid, in pixels. Kept from the
+/// previous detector: the candidate test below uses the same cell lattice, so
+/// a track near a line is evaluated the same way it used to be.
 pub const SOLID_LINE_GRID_CELL_PX: f32 = 64.0;
 
-/// A line spanning more cells than this is kept in the `large` list instead.
-/// Such a line would otherwise fill a big part of the grid, and a line across
-/// the whole frame is not the common case.
+/// A line spanning more cells than this used to be always checked.
 const MAX_CELLS_PER_LINE: usize = 256;
 
-/// A query spanning more cells than this falls back to checking all lines.
-/// This keeps a bogus, huge bounding box from making the query loop very long.
+/// A query spanning more cells than this used to fall back to checking
+/// everything.
 const MAX_CELLS_PER_QUERY: usize = 4096;
 
 /// One configured solid line together with the zone it belongs to.
@@ -71,14 +75,6 @@ impl SolidLineDefinition {
             Point2f::new(self.line.line[0][0], self.line.line[0][1]),
             Point2f::new(self.line.line[1][0], self.line.line[1][1]),
         )
-    }
-
-    fn signature(&self) -> LineSignature {
-        LineSignature {
-            start: self.line.line[0],
-            end: self.line.line[1],
-            margin_px: self.line.margin_px,
-        }
     }
 
     /// AABB of the segment expanded by `margin_px` on every side.
@@ -121,140 +117,6 @@ impl SolidLineDefinition {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct LineSignature {
-    start: [f32; 2],
-    end: [f32; 2],
-    margin_px: f32,
-}
-
-/// Bucket grid over solid lines. Cells hold indices into the line slice the
-/// index was built from.
-#[derive(Debug)]
-pub struct SolidLineIndex {
-    cell_size: f32,
-    cells: HashMap<(i32, i32), Vec<usize>>,
-    large: Vec<usize>,
-    line_count: usize,
-}
-
-impl SolidLineIndex {
-    pub fn new(lines: &[SolidLineDefinition]) -> Self {
-        Self::with_cell_size(lines, SOLID_LINE_GRID_CELL_PX)
-    }
-
-    pub fn with_cell_size(lines: &[SolidLineDefinition], cell_size: f32) -> Self {
-        let cell_size = if cell_size.is_finite() && cell_size > 0.0 {
-            cell_size
-        } else {
-            SOLID_LINE_GRID_CELL_PX
-        };
-        let mut cells: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-        let mut large = Vec::new();
-
-        for (index, line) in lines.iter().enumerate() {
-            let aabb = line.expanded_aabb();
-            if !aabb.is_finite() {
-                large.push(index);
-                continue;
-            }
-            let Some((min_cx, max_cx)) = cell_range(aabb.min_x, aabb.max_x, cell_size) else {
-                large.push(index);
-                continue;
-            };
-            let Some((min_cy, max_cy)) = cell_range(aabb.min_y, aabb.max_y, cell_size) else {
-                large.push(index);
-                continue;
-            };
-
-            let span_x = (max_cx - min_cx) as i64 + 1;
-            let span_y = (max_cy - min_cy) as i64 + 1;
-            if span_x > MAX_CELLS_PER_LINE as i64
-                || span_y > MAX_CELLS_PER_LINE as i64
-                || span_x.saturating_mul(span_y) > MAX_CELLS_PER_LINE as i64
-            {
-                large.push(index);
-                continue;
-            }
-
-            for cx in min_cx..=max_cx {
-                for cy in min_cy..=max_cy {
-                    cells.entry((cx, cy)).or_default().push(index);
-                }
-            }
-        }
-
-        SolidLineIndex {
-            cell_size,
-            cells,
-            large,
-            line_count: lines.len(),
-        }
-    }
-
-    /// Indices of lines whose expanded AABB may touch the query box.
-    pub fn candidates(&self, query: &Aabb) -> Vec<usize> {
-        let mut out = Vec::new();
-        self.candidates_into(query, &mut out);
-        out
-    }
-
-    /// Same as `candidates`, but appends to a caller-provided buffer so a
-    /// caller that queries many boxes per frame reuses the allocation.
-    pub fn candidates_into(&self, query: &Aabb, out: &mut Vec<usize>) {
-        out.clear();
-        if !query.is_finite() {
-            return;
-        }
-
-        let Some((min_cx, max_cx)) = cell_range(query.min_x, query.max_x, self.cell_size) else {
-            return;
-        };
-        let Some((min_cy, max_cy)) = cell_range(query.min_y, query.max_y, self.cell_size) else {
-            return;
-        };
-
-        let span_x = (max_cx - min_cx) as i64 + 1;
-        let span_y = (max_cy - min_cy) as i64 + 1;
-        if span_x > MAX_CELLS_PER_QUERY as i64
-            || span_y > MAX_CELLS_PER_QUERY as i64
-            || span_x.saturating_mul(span_y) > MAX_CELLS_PER_QUERY as i64
-        {
-            // A gigantic query is cheaper to answer by looking at everything.
-            out.extend(0..self.line_count);
-            return;
-        }
-
-        for cx in min_cx..=max_cx {
-            for cy in min_cy..=max_cy {
-                if let Some(bucket) = self.cells.get(&(cx, cy)) {
-                    out.extend_from_slice(bucket);
-                }
-            }
-        }
-        out.extend_from_slice(&self.large);
-        out.sort_unstable();
-        out.dedup();
-    }
-}
-
-/// Converts a coordinate span into an inclusive cell range. `None` means the
-/// span is not finite or does not fit into `i32` cell coordinates.
-fn cell_range(min: f32, max: f32, cell_size: f32) -> Option<(i32, i32)> {
-    if !min.is_finite() || !max.is_finite() {
-        return None;
-    }
-    let min_cell = (min / cell_size).floor();
-    let max_cell = (max / cell_size).floor();
-    if !min_cell.is_finite() || !max_cell.is_finite() {
-        return None;
-    }
-    if min_cell < i32::MIN as f32 || max_cell > i32::MAX as f32 {
-        return None;
-    }
-    Some((min_cell as i32, max_cell as i32))
-}
-
 #[derive(Debug, Clone)]
 struct TrackState {
     /// Last centre that was outside the neutral `margin_px` band. A vehicle
@@ -266,212 +128,80 @@ struct TrackState {
     fired: bool,
 }
 
-/// Zone-independent solid-line detector.
-///
-/// One instance lives for the whole run and is fed every active track once per
-/// frame. State is kept per `(line, track)` so the same crossing is reported
-/// once; line changes reset the state of that line, and stale entries are
-/// removed after `state_ttl_sec`.
-pub struct SolidLineDetector {
-    /// Crossing state per line, then per track. Two levels keep the hot path
-    /// free of String allocations: lookups use `&str`, and the line id is
-    /// cloned only when a line is seen for the first time.
-    tracks: HashMap<String, HashMap<Uuid, TrackState>>,
-    last_centers: HashMap<Uuid, (Point2f, f32)>,
-    line_signatures: HashMap<String, LineSignature>,
-    /// Bucket grid over the current lines. Rebuilt only when the line set or
-    /// its geometry changes, not on every frame.
-    index: SolidLineIndex,
-    /// Reused across candidate queries within a frame.
-    scratch: Vec<usize>,
-    state_ttl_sec: f32,
-    cleanup_interval_sec: f32,
-    next_cleanup_at: f32,
+impl TrackStateEntry for TrackState {
+    fn last_seen_at(&self) -> f32 {
+        self.last_seen_at
+    }
 }
 
-impl SolidLineDetector {
-    pub fn new(state_ttl_sec: f32, cleanup_interval_sec: f32) -> Self {
-        let state_ttl_sec = if state_ttl_sec.is_finite() {
-            state_ttl_sec.max(0.0)
+/// Where the centre of each track was on the previous frame: the swept area
+/// between the two catches a fast crossing that never sampled the line.
+#[derive(Debug, Clone)]
+struct LastCenter {
+    point: Point2f,
+    last_seen_at: f32,
+}
+
+impl TrackStateEntry for LastCenter {
+    fn last_seen_at(&self) -> f32 {
+        self.last_seen_at
+    }
+}
+
+/// Zone-independent solid-line rule for one configured line.
+///
+/// State is kept per track so the same crossing is reported once; the rule is
+/// replaced (state reset) when the coordinator sees the line changed, and
+/// stale entries are removed after `state_ttl_sec`.
+pub struct SolidLineRule {
+    line: SolidLineDefinition,
+    tracks: RuleStateStore<TrackState>,
+    last_centers: RuleStateStore<LastCenter>,
+}
+
+impl SolidLineRule {
+    pub fn new(line: SolidLineDefinition, runtime: RuleRuntimeConfig) -> Self {
+        let state_ttl_sec = if runtime.state_ttl_sec.is_finite() {
+            runtime.state_ttl_sec.max(0.0)
         } else {
             0.0
         };
-        let cleanup_interval_sec = if cleanup_interval_sec.is_finite() {
-            cleanup_interval_sec.max(0.0)
+        let cleanup_interval_sec = if runtime.cleanup_interval_sec.is_finite() {
+            runtime.cleanup_interval_sec.max(0.0)
         } else {
             0.0
         };
-        SolidLineDetector {
-            tracks: HashMap::new(),
-            last_centers: HashMap::new(),
-            line_signatures: HashMap::new(),
-            index: SolidLineIndex::new(&[]),
-            scratch: Vec::new(),
-            state_ttl_sec,
-            cleanup_interval_sec,
-            next_cleanup_at: 0.0,
+        SolidLineRule {
+            line,
+            tracks: RuleStateStore::new(state_ttl_sec, cleanup_interval_sec),
+            last_centers: RuleStateStore::new(state_ttl_sec, cleanup_interval_sec),
         }
     }
 
-    /// Evaluates every line against every observation of one frame.
-    ///
-    /// The returned events belong to the frame; the caller publishes them.
-    ///
-    /// Generic over the observation container so a caller that shares one
-    /// observation between consumers can pass `&[Arc<TrackObservation>]`
-    /// while unit tests keep passing `&[TrackObservation]`.
-    pub fn process_frame<T>(
+    /// Evaluates one observation against the line and returns the crossing
+    /// event, when this observation completes one.
+    fn process_observation(
         &mut self,
-        lines: &[SolidLineDefinition],
-        observations: &[T],
-    ) -> Vec<ViolationEvent>
-    where
-        T: std::borrow::Borrow<TrackObservation>,
-    {
-        self.refresh_lines(lines);
-        if observations.is_empty() {
-            return Vec::new();
-        }
-
-        let now = observations
-            .iter()
-            .map(|obs| obs.borrow().source_time_relative_sec)
-            .filter(|time| time.is_finite())
-            .fold(f32::NEG_INFINITY, f32::max);
-        if now.is_finite() {
-            self.cleanup_if_needed(now);
-        }
-
-        let mut events = Vec::new();
-        for obs in observations {
-            let obs = obs.borrow();
-            let now = obs.source_time_relative_sec;
-            if !now.is_finite() {
-                continue;
-            }
-
-            let bbox = Aabb::from_rect(&obs.bbox);
-            if !bbox.is_finite() {
-                continue;
-            }
-            let center = bbox.center();
-
-            // A fast track can jump from one side of the line to the other
-            // between two processed frames without touching the line in either
-            // sampled box. The query covers the whole swept area, so such a
-            // crossing still finds its line.
-            let query = match self.last_centers.get(&obs.track_id) {
-                Some((previous, _)) => bbox.union(&Aabb::point(*previous)),
-                None => bbox,
-            };
-
-            self.index.candidates_into(&query, &mut self.scratch);
-            let mut scratch_index = 0;
-            while scratch_index < self.scratch.len() {
-                let line_index = self.scratch[scratch_index];
-                let line = &lines[line_index];
-                if let Some(event) = self.process_line(line, obs, center, now) {
-                    events.push(event);
-                }
-                scratch_index += 1;
-            }
-
-            self.last_centers.insert(obs.track_id, (center, now));
-        }
-        events
-    }
-
-    /// Drops state for lines that disappeared or changed geometry. Without
-    /// this, moving a line under a track that already crossed it could either
-    /// suppress a real crossing or fire one that never happened.
-    ///
-    /// The common case is checked without allocations: the ids and signatures
-    /// of the incoming lines are compared against the stored ones by borrowing
-    /// their keys. The map is rebuilt only when something actually changed.
-    fn refresh_lines(&mut self, lines: &[SolidLineDefinition]) {
-        let unchanged = self.line_signatures.len() == lines.len()
-            && lines.iter().all(|line| {
-                self.line_signatures.get(line.id.as_str()) == Some(&line.signature())
-            });
-        if unchanged {
-            return;
-        }
-
-        let current: HashMap<String, LineSignature> = lines
-            .iter()
-            .map(|line| (line.id.clone(), line.signature()))
-            .collect();
-
-        let previous = &self.line_signatures;
-        self.tracks.retain(|line_id, _| {
-            current
-                .get(line_id)
-                .is_some_and(|signature| previous.get(line_id) == Some(signature))
-        });
-        self.line_signatures = current;
-        self.index = SolidLineIndex::new(lines);
-    }
-
-    fn cleanup_if_needed(&mut self, now: f32) {
-        if now < self.next_cleanup_at {
-            return;
-        }
-
-        let ttl = self.state_ttl_sec;
-        for by_track in self.tracks.values_mut() {
-            by_track.retain(|_, state| {
-                let age = now - state.last_seen_at;
-                age >= 0.0 && age <= ttl
-            });
-        }
-        self.tracks.retain(|_, by_track| !by_track.is_empty());
-        self.last_centers.retain(|_, (_, seen_at)| {
-            let age = now - *seen_at;
-            age >= 0.0 && age <= ttl
-        });
-        self.next_cleanup_at = now + self.cleanup_interval_sec;
-    }
-
-    fn process_line(
-        &mut self,
-        line: &SolidLineDefinition,
         obs: &TrackObservation,
         center: Point2f,
         now: f32,
     ) -> Option<ViolationEvent> {
-        if !line.line.is_valid() {
+        if !self.line.line.is_valid() {
             return None;
         }
 
-        let side = line.classify_side(center);
-        let touches = line.intersects_bbox(&obs.bbox);
-        let (line_start, line_end) = line.endpoints();
+        let side = self.line.classify_side(center);
+        let touches = self.line.intersects_bbox(&obs.bbox);
+        let (line_start, line_end) = self.line.endpoints();
 
-        let expired = self
-            .tracks
-            .get(line.id.as_str())
-            .and_then(|by_track| by_track.get(&obs.track_id))
-            .map_or(false, |state| {
-                let age = now - state.last_seen_at;
-                age < 0.0 || age > self.state_ttl_sec
-            });
-        if expired {
-            if let Some(by_track) = self.tracks.get_mut(line.id.as_str()) {
-                by_track.remove(&obs.track_id);
-            }
-        }
+        self.tracks.remove_expired(&obs.track_id, now);
 
-        let state = self
-            .tracks
-            .entry(line.id.clone())
-            .or_default()
-            .entry(obs.track_id)
-            .or_insert_with(|| TrackState {
-                last_non_neutral_center: center,
-                last_non_neutral_side: side,
-                last_seen_at: now,
-                fired: false,
-            });
+        let state = self.tracks.entry(obs.track_id).or_insert(TrackState {
+            last_non_neutral_center: center,
+            last_non_neutral_side: side,
+            last_seen_at: now,
+            fired: false,
+        });
         state.last_seen_at = now;
 
         if state.fired {
@@ -514,54 +244,184 @@ impl SolidLineDetector {
         let intersection = segment_intersection_point(previous_center, center, line_start, line_end)
             .unwrap_or(center);
 
-        Some(make_event(line, obs, previous_side, side, intersection))
+        Some(self.make_event(obs, previous_side, side, intersection))
     }
 
-    /// Test hook: how many `(line, track)` states are alive right now.
+    /// Whether the swept query may touch the line: the same cell-lattice test
+    /// the bucket grid of the previous detector applied, ported for a single
+    /// line. It is deliberately looser than an exact AABB intersection: a
+    /// track near the line establishes its side baseline before the box
+    /// actually reaches the line, which is what the crossing detection
+    /// depends on.
+    fn query_may_touch(&self, query: &Aabb) -> bool {
+        if !query.is_finite() {
+            return false;
+        }
+        let Some((query_min_cx, query_max_cx)) =
+            cell_range(query.min_x, query.max_x, SOLID_LINE_GRID_CELL_PX)
+        else {
+            return false;
+        };
+        let Some((query_min_cy, query_max_cy)) =
+            cell_range(query.min_y, query.max_y, SOLID_LINE_GRID_CELL_PX)
+        else {
+            return false;
+        };
+
+        let span_x = (query_max_cx - query_min_cx) as i64 + 1;
+        let span_y = (query_max_cy - query_min_cy) as i64 + 1;
+        if span_x > MAX_CELLS_PER_QUERY as i64
+            || span_y > MAX_CELLS_PER_QUERY as i64
+            || span_x.saturating_mul(span_y) > MAX_CELLS_PER_QUERY as i64
+        {
+            // A gigantic query was answered by looking at everything.
+            return true;
+        }
+
+        let line_aabb = self.line.expanded_aabb();
+        if !line_aabb.is_finite() {
+            // A non-finite line went into the always-checked list.
+            return true;
+        }
+        let Some((line_min_cx, line_max_cx)) =
+            cell_range(line_aabb.min_x, line_aabb.max_x, SOLID_LINE_GRID_CELL_PX)
+        else {
+            return true;
+        };
+        let Some((line_min_cy, line_max_cy)) =
+            cell_range(line_aabb.min_y, line_aabb.max_y, SOLID_LINE_GRID_CELL_PX)
+        else {
+            return true;
+        };
+        let line_span_x = (line_max_cx - line_min_cx) as i64 + 1;
+        let line_span_y = (line_max_cy - line_min_cy) as i64 + 1;
+        if line_span_x > MAX_CELLS_PER_LINE as i64
+            || line_span_y > MAX_CELLS_PER_LINE as i64
+            || line_span_x.saturating_mul(line_span_y) > MAX_CELLS_PER_LINE as i64
+        {
+            // A huge line was always checked.
+            return true;
+        }
+
+        ranges_overlap(query_min_cx, query_max_cx, line_min_cx, line_max_cx)
+            && ranges_overlap(query_min_cy, query_max_cy, line_min_cy, line_max_cy)
+    }
+
+    fn make_event(
+        &self,
+        obs: &TrackObservation,
+        previous_side: i32,
+        side: i32,
+        intersection: Point2f,
+    ) -> ViolationEvent {
+        ViolationEvent::from_observation(
+            obs,
+            "traffic.solid_line_crossing",
+            self.line.zone_id.clone(),
+            self.line.id.clone(),
+            format!(
+                "track bbox crossed solid line '{}': side {} -> {}",
+                self.line.id, previous_side, side
+            ),
+        )
+        .for_solid_line(self.line.id.clone(), intersection)
+    }
+
+    /// Test hook: how many track states are alive right now.
     #[cfg(test)]
     fn state_count(&self) -> usize {
-        self.tracks.values().map(|by_track| by_track.len()).sum()
+        self.tracks.len()
     }
 }
 
-fn make_event(
-    line: &SolidLineDefinition,
-    obs: &TrackObservation,
-    previous_side: i32,
-    side: i32,
-    intersection: Point2f,
-) -> ViolationEvent {
-    ViolationEvent {
-        event_id: Uuid::new_v4(),
-        event_type: "traffic.solid_line_crossing".to_string(),
-        status: ViolationStatus::Confirmed,
-        equipment_id: obs.equipment_id.clone(),
-        track_id: obs.track_id,
-        observed_at: obs.observed_at,
-        source_time_relative_sec: obs.source_time_relative_sec,
-        class_name: obs.class_name.clone(),
-        confidence: obs.confidence,
-        bbox: obs.bbox,
-        anchor_px: obs.anchor_px,
-        image_point_px: obs.image_point_px,
-        projected_point: obs.projected_point,
-        zone_id: line.zone_id.clone(),
-        previous_zone_id: obs.previous_zone_id.clone(),
-        crossed_virtual_line: obs.crossed_virtual_line,
-        speed_kmh: obs.speed_kmh,
-        solid_line_id: Some(line.id.clone()),
-        intersection_px: Some(intersection),
-        rule_id: line.id.clone(),
-        details: format!(
-            "track bbox crossed solid line '{}': side {} -> {}",
-            line.id, previous_side, side
-        ),
+/// Converts a coordinate span into an inclusive cell range. `None` means the
+/// span is not finite or does not fit into `i32` cell coordinates.
+fn cell_range(min: f32, max: f32, cell_size: f32) -> Option<(i32, i32)> {
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+    let min_cell = (min / cell_size).floor();
+    let max_cell = (max / cell_size).floor();
+    if !min_cell.is_finite() || !max_cell.is_finite() {
+        return None;
+    }
+    if min_cell < i32::MIN as f32 || max_cell > i32::MAX as f32 {
+        return None;
+    }
+    Some((min_cell as i32, max_cell as i32))
+}
+
+/// Whether two inclusive cell ranges share at least one cell.
+fn ranges_overlap(a_min: i32, a_max: i32, b_min: i32, b_max: i32) -> bool {
+    a_min <= b_max && b_min <= a_max
+}
+
+impl ViolationRule for SolidLineRule {
+    /// Evaluates every observation of the frame against the line.
+    ///
+    /// The returned events belong to the frame; the coordinator publishes them.
+    fn process_frame(&mut self, observations: &[TrackObservation]) -> Vec<ViolationEvent> {
+        let now = observations
+            .iter()
+            .map(|obs| obs.source_time_relative_sec)
+            .filter(|time| time.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
+        if now.is_finite() {
+            self.tracks.cleanup_if_needed(now);
+            self.last_centers.cleanup_if_needed(now);
+        }
+
+        let mut events = Vec::new();
+        for obs in observations {
+            let now = obs.source_time_relative_sec;
+            if !now.is_finite() {
+                continue;
+            }
+
+            let bbox = Aabb::from_rect(&obs.bbox);
+            if !bbox.is_finite() {
+                continue;
+            }
+            let center = bbox.center();
+
+            // A fast track can jump from one side of the line to the other
+            // between two processed frames without touching the line in either
+            // sampled box. The swept area still crosses it, and the path
+            // crossing check catches that; a track that stayed far away keeps
+            // its state untouched, so it can age out by the TTL.
+            let query = match self.last_centers.get(&obs.track_id) {
+                Some(previous) => bbox.union(&Aabb::point(previous.point)),
+                None => bbox,
+            };
+
+            if self.query_may_touch(&query) {
+                if let Some(event) = self.process_observation(obs, center, now) {
+                    events.push(event);
+                }
+            }
+
+            match self.last_centers.entry(obs.track_id) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().point = center;
+                    entry.get_mut().last_seen_at = now;
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(LastCenter {
+                        point: center,
+                        last_seen_at: now,
+                    });
+                }
+            }
+        }
+        events
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lib::cv::Rect;
+    use crate::lib::spatial::Point2f;
     use chrono::Utc;
 
     fn observation(
@@ -602,32 +462,15 @@ mod tests {
         )
     }
 
-    #[test]
-    fn segment_intersects_rectangle() {
-        let rect = Aabb::new(10.0, 10.0, 30.0, 30.0);
-        assert!(segment_intersects_rect(
-            Point2f::new(0.0, 20.0),
-            Point2f::new(40.0, 20.0),
-            &rect
-        ));
-        // Diagonally through opposite corners.
-        assert!(segment_intersects_rect(
-            Point2f::new(0.0, 0.0),
-            Point2f::new(40.0, 40.0),
-            &rect
-        ));
-        // One endpoint inside.
-        assert!(segment_intersects_rect(
-            Point2f::new(20.0, 20.0),
-            Point2f::new(50.0, 50.0),
-            &rect
-        ));
-        // Fully outside.
-        assert!(!segment_intersects_rect(
-            Point2f::new(0.0, 5.0),
-            Point2f::new(40.0, 5.0),
-            &rect
-        ));
+    fn runtime() -> RuleRuntimeConfig {
+        RuleRuntimeConfig {
+            state_ttl_sec: 10.0,
+            cleanup_interval_sec: 1.0,
+        }
+    }
+
+    fn rule(line: SolidLineDefinition) -> SolidLineRule {
+        SolidLineRule::new(line, runtime())
     }
 
     #[test]
@@ -642,50 +485,16 @@ mod tests {
     }
 
     #[test]
-    fn index_returns_only_nearby_lines() {
-        let near = horizontal_line("near", 100.0, 0.0);
-        let far = SolidLineDefinition::new(
-            "far".to_string(),
-            None,
-            SolidLine::new([[1000.0, 1000.0], [1100.0, 1000.0]], 0.0),
-        );
-        let index = SolidLineIndex::new(&[near, far]);
-        let bbox = Rect::new(10, 90, 20, 20);
-
-        assert_eq!(index.candidates(&Aabb::from_rect(&bbox)), vec![0]);
-    }
-
-    #[test]
-    fn a_long_line_falls_back_to_the_always_checked_list() {
-        let long = SolidLineDefinition::new(
-            "long".to_string(),
-            None,
-            SolidLine::new([[0.0, 0.0], [20000.0, 0.0]], 0.0),
-        );
-        let short = horizontal_line("short", 100.0, 0.0);
-        let index = SolidLineIndex::new(&[long, short]);
-        let bbox = Rect::new(10, 90, 20, 20);
-
-        let candidates = index.candidates(&Aabb::from_rect(&bbox));
-        assert!(candidates.contains(&0));
-        assert!(candidates.contains(&1));
-    }
-
-    #[test]
     fn crossing_is_detected_outside_any_zone() {
         let line = horizontal_line("zone-1.solid_line", 100.0, 5.0);
         let track = Uuid::new_v4();
-        let mut detector = SolidLineDetector::new(10.0, 1.0);
+        let mut rule = rule(line);
 
         let before = observation(track, 1.0, 100.0, 80.0, 20, 20, None);
-        assert!(
-            detector
-                .process_frame(&[line.clone()], &[before])
-                .is_empty()
-        );
+        assert!(rule.process_frame(&[before]).is_empty());
 
         let after = observation(track, 1.1, 100.0, 120.0, 20, 20, None);
-        let events = detector.process_frame(&[line], &[after]);
+        let events = rule.process_frame(&[after]);
 
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -704,16 +513,10 @@ mod tests {
             SolidLine::new([[0.0, 100.0], [200.0, 100.0]], 5.0),
         );
         let track = Uuid::new_v4();
-        let mut detector = SolidLineDetector::new(10.0, 1.0);
+        let mut rule = rule(line);
 
-        detector.process_frame(
-            &[line.clone()],
-            &[observation(track, 1.0, 100.0, 80.0, 20, 20, None)],
-        );
-        let events = detector.process_frame(
-            &[line],
-            &[observation(track, 1.1, 100.0, 120.0, 20, 20, None)],
-        );
+        rule.process_frame(&[observation(track, 1.0, 100.0, 80.0, 20, 20, None)]);
+        let events = rule.process_frame(&[observation(track, 1.1, 100.0, 120.0, 20, 20, None)]);
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].zone_id, None);
@@ -727,28 +530,17 @@ mod tests {
     fn one_track_reports_a_crossing_once() {
         let line = horizontal_line("line", 100.0, 5.0);
         let track = Uuid::new_v4();
-        let mut detector = SolidLineDetector::new(10.0, 1.0);
+        let mut rule = rule(line);
 
-        detector.process_frame(
-            &[line.clone()],
-            &[observation(track, 1.0, 100.0, 80.0, 20, 20, None)],
-        );
+        rule.process_frame(&[observation(track, 1.0, 100.0, 80.0, 20, 20, None)]);
         assert_eq!(
-            detector
-                .process_frame(
-                    &[line.clone()],
-                    &[observation(track, 1.1, 100.0, 120.0, 20, 20, None)]
-                )
+            rule.process_frame(&[observation(track, 1.1, 100.0, 120.0, 20, 20, None)])
                 .len(),
             1
         );
         // Going back over the same line must not produce a second event.
         assert!(
-            detector
-                .process_frame(
-                    &[line],
-                    &[observation(track, 1.2, 100.0, 80.0, 20, 20, None)]
-                )
+            rule.process_frame(&[observation(track, 1.2, 100.0, 80.0, 20, 20, None)])
                 .is_empty()
         );
     }
@@ -756,34 +548,22 @@ mod tests {
     #[test]
     fn margin_can_keep_a_nearby_track_neutral() {
         let track = Uuid::new_v4();
-        let wide = horizontal_line("wide", 100.0, 50.0);
-        let mut detector = SolidLineDetector::new(10.0, 1.0);
 
-        detector.process_frame(
-            &[wide.clone()],
-            &[observation(track, 1.0, 100.0, 80.0, 20, 20, None)],
-        );
+        let wide = horizontal_line("wide", 100.0, 50.0);
+        let mut wide_rule = rule(wide);
+        wide_rule.process_frame(&[observation(track, 1.0, 100.0, 80.0, 20, 20, None)]);
         assert!(
-            detector
-                .process_frame(
-                    &[wide],
-                    &[observation(track, 1.1, 100.0, 120.0, 20, 20, None)]
-                )
+            wide_rule
+                .process_frame(&[observation(track, 1.1, 100.0, 120.0, 20, 20, None)])
                 .is_empty()
         );
 
         let narrow = horizontal_line("narrow", 100.0, 5.0);
-        let mut detector = SolidLineDetector::new(10.0, 1.0);
-        detector.process_frame(
-            &[narrow.clone()],
-            &[observation(track, 1.0, 100.0, 80.0, 20, 20, None)],
-        );
+        let mut narrow_rule = rule(narrow);
+        narrow_rule.process_frame(&[observation(track, 1.0, 100.0, 80.0, 20, 20, None)]);
         assert_eq!(
-            detector
-                .process_frame(
-                    &[narrow],
-                    &[observation(track, 1.1, 100.0, 120.0, 20, 20, None)]
-                )
+            narrow_rule
+                .process_frame(&[observation(track, 1.1, 100.0, 120.0, 20, 20, None)])
                 .len(),
             1
         );
@@ -793,78 +573,52 @@ mod tests {
     fn crossing_through_the_margin_band_is_detected() {
         let line = horizontal_line("line", 100.0, 10.0);
         let track = Uuid::new_v4();
-        let mut detector = SolidLineDetector::new(10.0, 1.0);
+        let mut rule = rule(line);
 
         // Above the line, outside the band.
-        detector.process_frame(
-            &[line.clone()],
-            &[observation(track, 1.0, 100.0, 80.0, 20, 20, None)],
-        );
+        rule.process_frame(&[observation(track, 1.0, 100.0, 80.0, 20, 20, None)]);
         // Inside the band: the side is 0 on both of these frames.
-        detector.process_frame(
-            &[line.clone()],
-            &[observation(track, 1.1, 100.0, 95.0, 20, 20, None)],
-        );
-        detector.process_frame(
-            &[line.clone()],
-            &[observation(track, 1.2, 100.0, 105.0, 20, 20, None)],
-        );
+        rule.process_frame(&[observation(track, 1.1, 100.0, 95.0, 20, 20, None)]);
+        rule.process_frame(&[observation(track, 1.2, 100.0, 105.0, 20, 20, None)]);
         // Out of the band on the other side. The comparison is against the
         // last non-neutral point, so this is one crossing.
-        let events = detector.process_frame(
-            &[line],
-            &[observation(track, 1.3, 100.0, 120.0, 20, 20, None)],
-        );
+        let events = rule.process_frame(&[observation(track, 1.3, 100.0, 120.0, 20, 20, None)]);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].solid_line_id.as_deref(), Some("line"));
     }
 
     #[test]
-    fn moving_a_line_resets_the_state_of_that_line() {
+    fn moving_a_line_starts_a_fresh_rule_with_fresh_state() {
         let track = Uuid::new_v4();
-        let first = horizontal_line("line", 100.0, 5.0);
-        let moved = horizontal_line("line", 300.0, 5.0);
-        let mut detector = SolidLineDetector::new(10.0, 1.0);
 
-        detector.process_frame(
-            &[first.clone()],
-            &[observation(track, 1.0, 100.0, 80.0, 20, 20, None)],
-        );
+        // The coordinator replaces the rule when the line moves: a new rule
+        // instance carries no crossing state and no swept-path history, like
+        // the previous detector's per-line reset of the crossing state.
+        let mut before = rule(horizontal_line("line", 100.0, 5.0));
+        before.process_frame(&[observation(track, 1.0, 100.0, 80.0, 20, 20, None)]);
         assert_eq!(
-            detector
-                .process_frame(
-                    &[first],
-                    &[observation(track, 1.1, 100.0, 120.0, 20, 20, None)]
-                )
+            before
+                .process_frame(&[observation(track, 1.1, 100.0, 120.0, 20, 20, None)])
                 .len(),
             1
         );
-        assert_eq!(detector.state_count(), 1);
+        assert_eq!(before.state_count(), 1);
 
-        // The line moved below the track. The old crossing state must not be
-        // reused; the first frame with the new line establishes a baseline.
-        detector.process_frame(
-            &[moved.clone()],
-            &[observation(track, 1.2, 100.0, 200.0, 20, 20, None)],
-        );
-        assert_eq!(detector.state_count(), 0);
+        // New rule with the moved line: state starts empty.
+        let mut after = rule(horizontal_line("line", 300.0, 5.0));
+        assert_eq!(after.state_count(), 0);
 
-        // The track is below the new line now: no crossing yet.
+        // The first frame near the moved line establishes the baseline side
+        // (the track is above the line), with no event.
         assert!(
-            detector
-                .process_frame(
-                    &[moved.clone()],
-                    &[observation(track, 1.3, 100.0, 400.0, 20, 20, None)]
-                )
+            after
+                .process_frame(&[observation(track, 1.3, 100.0, 250.0, 20, 20, None)])
                 .is_empty()
         );
-        // Moving back over it is a real crossing of the new geometry.
+        // Moving over it is a real crossing of the new geometry.
         assert_eq!(
-            detector
-                .process_frame(
-                    &[moved],
-                    &[observation(track, 1.4, 100.0, 250.0, 20, 20, None)]
-                )
+            after
+                .process_frame(&[observation(track, 1.4, 100.0, 400.0, 20, 20, None)])
                 .len(),
             1
         );
