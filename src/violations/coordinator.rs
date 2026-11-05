@@ -4,9 +4,8 @@ use crate::lib::track_observations::TrackObservation;
 use crate::lib::zones::VirtualLineDirection;
 use crate::settings::{RoadLanesSettings, ViolationsSettings};
 use crate::violations::event::ViolationEvent;
-use crate::violations::rules::no_parking::NoParkingRule;
-use crate::violations::rules::no_stopping::NoStoppingRule;
 use crate::violations::rules::speeding::SpeedingRule;
+use crate::violations::rules::stationary::{StationaryRuleKind, StationaryZoneRule};
 use crate::violations::rules::wrong_way::WrongWayRule;
 use crate::violations::rules::ViolationRule;
 
@@ -54,20 +53,22 @@ impl ViolationCoordinator {
                 }
 
                 if let Some(rule) = &lane.rules.no_stopping {
-                    rules.push(Box::new(NoStoppingRule::from_embedded(
+                    rules.push(Box::new(StationaryZoneRule::from_embedded(
                         zone_id.clone(),
                         lane.geometry.clone(),
                         rule.clone(),
                         runtime,
+                        StationaryRuleKind::NoStopping,
                     )));
                 }
 
                 if let Some(rule) = &lane.rules.no_parking {
-                    rules.push(Box::new(NoParkingRule::from_embedded(
+                    rules.push(Box::new(StationaryZoneRule::from_embedded(
                         zone_id.clone(),
                         lane.geometry.clone(),
                         rule.clone(),
                         runtime,
+                        StationaryRuleKind::NoParking,
                     )));
                 }
 

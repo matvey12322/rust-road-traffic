@@ -1,12 +1,11 @@
-use std::collections::HashMap;
-
 use uuid::Uuid;
 
 use crate::lib::spatial::Point2f;
 use crate::lib::track_observations::TrackObservation;
 use crate::lib::zones::geometry::polygon_contains_point;
 use crate::violations::coordinator::RuleRuntimeConfig;
-use crate::violations::event::{ViolationEvent, ViolationStatus};
+use crate::violations::event::ViolationEvent;
+use crate::violations::rules::state::{RuleStateStore, TrackStateEntry};
 use crate::violations::rules::ViolationRule;
 
 #[derive(Debug, Clone)]
@@ -18,16 +17,19 @@ struct TrackState {
     fired: bool,
 }
 
+impl TrackStateEntry for TrackState {
+    fn last_seen_at(&self) -> f32 {
+        self.last_seen_at
+    }
+}
+
 pub struct WrongWayRule {
     rule_id: String,
     zone_id: String,
     polygon_px: Vec<Point2f>,
     allowed_direction_unit: [f32; 2],
     min_direction_samples: usize,
-    state_ttl_sec: f32,
-    cleanup_interval_sec: f32,
-    next_cleanup_at: f32,
-    tracks: HashMap<Uuid, TrackState>,
+    tracks: RuleStateStore<TrackState>,
 }
 
 impl WrongWayRule {
@@ -56,28 +58,11 @@ impl WrongWayRule {
                 .collect(),
             allowed_direction_unit: [allowed_direction_unit.0, allowed_direction_unit.1],
             min_direction_samples: min_direction_samples.max(2),
-            state_ttl_sec: runtime.state_ttl_sec.max(0.1),
-            cleanup_interval_sec: runtime.cleanup_interval_sec.max(0.1),
-            next_cleanup_at: 0.0,
-            tracks: HashMap::new(),
+            tracks: RuleStateStore::new(
+                runtime.state_ttl_sec.max(0.1),
+                runtime.cleanup_interval_sec.max(0.1),
+            ),
         }
-    }
-
-    /// Removes track state older than the configured TTL when cleanup is due.
-    /// Age is measured from each track's last observation in source time;
-    /// entries with a negative age are discarded too.
-    fn cleanup_if_needed(&mut self, now: f32) {
-        if now < self.next_cleanup_at {
-            return;
-        }
-
-        let ttl = self.state_ttl_sec;
-        self.tracks.retain(|_, state| {
-            let age = now - state.last_seen_at;
-            age >= 0.0 && age <= ttl
-        });
-
-        self.next_cleanup_at = now + self.cleanup_interval_sec;
     }
 
     /// Converts a vector into a unit vector.
@@ -110,32 +95,16 @@ impl WrongWayRule {
     /// normalized movement direction, and its alignment with the allowed
     /// direction. The details include the configured sample threshold.
     fn make_event(&self, obs: &TrackObservation, movement: (f32, f32), dot: f32) -> ViolationEvent {
-        ViolationEvent {
-            event_id: Uuid::new_v4(),
-            event_type: "traffic.wrong_way".to_string(),
-            status: ViolationStatus::Confirmed,
-            equipment_id: obs.equipment_id.clone(),
-            track_id: obs.track_id,
-            observed_at: obs.observed_at,
-            source_time_relative_sec: obs.source_time_relative_sec,
-            class_name: obs.class_name.clone(),
-            confidence: obs.confidence,
-            bbox: obs.bbox.clone(),
-            anchor_px: obs.anchor_px.clone(),
-            image_point_px: obs.image_point_px.clone(),
-            projected_point: obs.projected_point.clone(),
-            zone_id: Some(self.zone_id.clone()),
-            previous_zone_id: obs.previous_zone_id.clone(),
-            crossed_virtual_line: obs.crossed_virtual_line,
-            speed_kmh: obs.speed_kmh,
-            solid_line_id: None,
-            intersection_px: None,
-            rule_id: self.rule_id.clone(),
-            details: format!(
+        ViolationEvent::from_observation(
+            obs,
+            "traffic.wrong_way",
+            Some(self.zone_id.clone()),
+            self.rule_id.clone(),
+            format!(
                 "track moved in forbidden direction in zone '{}' after {} samples; movement=({:.3}, {:.3}), alignment={:.3}",
                 self.zone_id, self.min_direction_samples, movement.0, movement.1, dot,
             ),
-        }
+        )
     }
 }
 
@@ -156,7 +125,7 @@ impl ViolationRule for WrongWayRule {
         if !now.is_finite() {
             return Vec::new();
         }
-        self.cleanup_if_needed(now);
+        self.tracks.cleanup_if_needed(now);
 
         if obs.zone_id.as_deref() != Some(self.zone_id.as_str()) {
             self.tracks.remove(&obs.track_id);
@@ -215,6 +184,7 @@ impl ViolationRule for WrongWayRule {
         Vec::new()
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

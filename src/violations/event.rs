@@ -1,5 +1,6 @@
 use crate::lib::cv::Rect;
 use crate::lib::spatial::Point2f;
+use crate::lib::track_observations::TrackObservation;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
@@ -44,4 +45,49 @@ pub struct ViolationEvent {
     pub intersection_px: Option<Point2f>,
     pub rule_id: String,
     pub details: String,
+}
+
+impl ViolationEvent {
+    /// Builds a confirmed event that mirrors the observation. `event_type` and
+    /// `rule_id` identify the rule; `details` carries the rule's explanation.
+    /// Rules override specific fields (for example `speed_kmh` or the solid
+    /// line) after construction.
+    pub fn from_observation(
+        obs: &TrackObservation,
+        event_type: &str,
+        zone_id: Option<String>,
+        rule_id: String,
+        details: String,
+    ) -> Self {
+        ViolationEvent {
+            event_id: Uuid::new_v4(),
+            event_type: event_type.to_string(),
+            status: ViolationStatus::Confirmed,
+            equipment_id: obs.equipment_id.clone(),
+            track_id: obs.track_id,
+            observed_at: obs.observed_at,
+            source_time_relative_sec: obs.source_time_relative_sec,
+            class_name: obs.class_name.clone(),
+            confidence: obs.confidence,
+            bbox: obs.bbox,
+            anchor_px: obs.anchor_px,
+            image_point_px: obs.image_point_px,
+            projected_point: obs.projected_point,
+            zone_id,
+            previous_zone_id: obs.previous_zone_id.clone(),
+            crossed_virtual_line: obs.crossed_virtual_line,
+            speed_kmh: obs.speed_kmh,
+            solid_line_id: None,
+            intersection_px: None,
+            rule_id,
+            details,
+        }
+    }
+
+    /// Attaches the solid line the event comes from and the crossing point.
+    pub fn for_solid_line(mut self, line_id: String, intersection: Point2f) -> Self {
+        self.solid_line_id = Some(line_id);
+        self.intersection_px = Some(intersection);
+        self
+    }
 }

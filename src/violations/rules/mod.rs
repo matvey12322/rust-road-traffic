@@ -1,6 +1,6 @@
-pub mod no_parking;
-pub mod no_stopping;
 pub mod speeding;
+pub mod state;
+pub mod stationary;
 pub mod wrong_way;
 
 use crate::lib::track_observations::TrackObservation;
