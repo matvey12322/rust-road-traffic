@@ -971,6 +971,37 @@ fn run(
 }
 #[tokio::main]
 async fn main() {
+    // With `--features profile-run` the whole process is sampled (the kernel's
+    // perf_event_open; the `perf` binary is not required) and the flamegraph
+    // is written to flamegraph.svg when the run ends normally. Ctrl-C / SIGKILL
+    // skip the write: let the video end.
+    #[cfg(feature = "profile-run")]
+    let _profile = {
+        struct FlamegraphGuard(pprof::ProfilerGuard<'static>);
+        impl Drop for FlamegraphGuard {
+            fn drop(&mut self) {
+                match self.0.report().build() {
+                    Ok(report) => match std::fs::File::create("flamegraph.svg") {
+                        Ok(file) => {
+                            if let Err(err) = report.flamegraph(file) {
+                                eprintln!("flamegraph write failed: {err}");
+                            } else {
+                                eprintln!("flamegraph written to flamegraph.svg");
+                            }
+                        }
+                        Err(err) => eprintln!("can't create flamegraph.svg: {err}"),
+                    },
+                    Err(err) => eprintln!("flamegraph report failed: {err}"),
+                }
+            }
+        }
+        FlamegraphGuard(
+            pprof::ProfilerGuardBuilder::default()
+                .frequency(199)
+                .build()
+                .expect("pprof profiler"),
+        )
+    };
     logging::init_logger();
     info!(
         scope = logging::SCOPE_STARTUP,
