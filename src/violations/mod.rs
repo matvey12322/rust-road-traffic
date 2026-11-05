@@ -4,11 +4,11 @@ pub mod rules;
 pub mod sink;
 pub mod solid_line;
 
+use self::coordinator::ViolationCoordinator;
+use self::sink::{ConsoleSink, EventSink};
 use crate::lib::data_storage::ThreadedDataStorage;
 use crate::lib::track_observations::{TrackObservationRx, TrackObservations};
 use crate::settings::ViolationsSettings;
-use self::coordinator::ViolationCoordinator;
-use self::sink::{ConsoleSink, EventSink};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};

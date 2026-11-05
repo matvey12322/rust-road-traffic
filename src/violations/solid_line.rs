@@ -10,10 +10,7 @@
 //! replaces the rule, which resets that line's crossing state exactly like
 //! the per-line reset of the previous detector.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-
-use uuid::Uuid;
 
 use crate::lib::cv::Rect;
 use crate::lib::spatial::{Aabb, Point2f};
@@ -241,8 +238,9 @@ impl SolidLineRule {
         }
         state.fired = true;
 
-        let intersection = segment_intersection_point(previous_center, center, line_start, line_end)
-            .unwrap_or(center);
+        let intersection =
+            segment_intersection_point(previous_center, center, line_start, line_end)
+                .unwrap_or(center);
 
         Some(self.make_event(obs, previous_side, side, intersection))
     }
@@ -394,10 +392,10 @@ impl ViolationRule for SolidLineRule {
                 None => bbox,
             };
 
-            if self.query_may_touch(&query) {
-                if let Some(event) = self.process_observation(obs, center, now) {
-                    events.push(event);
-                }
+            if self.query_may_touch(&query)
+                && let Some(event) = self.process_observation(obs, center, now)
+            {
+                events.push(event);
             }
 
             match self.last_centers.entry(obs.track_id) {
@@ -423,6 +421,7 @@ mod tests {
     use crate::lib::cv::Rect;
     use crate::lib::spatial::Point2f;
     use chrono::Utc;
+    use uuid::Uuid;
 
     fn observation(
         track_id: Uuid,
@@ -539,10 +538,9 @@ mod tests {
             1
         );
         // Going back over the same line must not produce a second event.
-        assert!(
-            rule.process_frame(&[observation(track, 1.2, 100.0, 80.0, 20, 20, None)])
-                .is_empty()
-        );
+        assert!(rule
+            .process_frame(&[observation(track, 1.2, 100.0, 80.0, 20, 20, None)])
+            .is_empty());
     }
 
     #[test]
@@ -552,11 +550,9 @@ mod tests {
         let wide = horizontal_line("wide", 100.0, 50.0);
         let mut wide_rule = rule(wide);
         wide_rule.process_frame(&[observation(track, 1.0, 100.0, 80.0, 20, 20, None)]);
-        assert!(
-            wide_rule
-                .process_frame(&[observation(track, 1.1, 100.0, 120.0, 20, 20, None)])
-                .is_empty()
-        );
+        assert!(wide_rule
+            .process_frame(&[observation(track, 1.1, 100.0, 120.0, 20, 20, None)])
+            .is_empty());
 
         let narrow = horizontal_line("narrow", 100.0, 5.0);
         let mut narrow_rule = rule(narrow);
@@ -610,11 +606,9 @@ mod tests {
 
         // The first frame near the moved line establishes the baseline side
         // (the track is above the line), with no event.
-        assert!(
-            after
-                .process_frame(&[observation(track, 1.3, 100.0, 250.0, 20, 20, None)])
-                .is_empty()
-        );
+        assert!(after
+            .process_frame(&[observation(track, 1.3, 100.0, 250.0, 20, 20, None)])
+            .is_empty());
         // Moving over it is a real crossing of the new geometry.
         assert_eq!(
             after

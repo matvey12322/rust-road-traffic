@@ -1,5 +1,3 @@
-use uuid::Uuid;
-
 use crate::lib::spatial::Point2f;
 use crate::lib::track_observations::TrackObservation;
 use crate::lib::zones::geometry::polygon_contains_point;
@@ -106,11 +104,7 @@ impl SpeedingRule {
             return Vec::new();
         }
 
-        if !polygon_contains_point(
-            &self.polygon_px,
-            obs.image_point_px.x,
-            obs.image_point_px.y,
-        ) {
+        if !polygon_contains_point(&self.polygon_px, obs.image_point_px.x, obs.image_point_px.y) {
             self.fired_tracks.remove(&obs.track_id);
             return Vec::new();
         }
@@ -143,11 +137,10 @@ impl SpeedingRule {
 mod tests {
     use super::*;
     use crate::lib::track_observations::test_support::observation;
+    use uuid::Uuid;
     use crate::settings::LaneSpeedingRuleSettings;
     use crate::violations::coordinator::RuleRuntimeConfig;
-    use uuid::Uuid;
-
-    fn rule() -> SpeedingRule {
+        fn rule() -> SpeedingRule {
         SpeedingRule::from_embedded(
             "zone-a".to_string(),
             vec![[0, 0], [100, 0], [100, 100], [0, 100]],
@@ -171,7 +164,7 @@ mod tests {
         let mut speeding = rule();
         let track = Uuid::new_v4();
 
-        let mut obs = |image_y: f32, anchor_y: f32| TrackObservation {
+        let obs = |image_y: f32, anchor_y: f32| TrackObservation {
             equipment_id: "eq".to_string(),
             track_id: track,
             observed_at: Utc::now(),
@@ -197,12 +190,14 @@ mod tests {
         // when the anchor is inside.
         let mut other_rule = rule();
         let other = Uuid::new_v4();
-        let mut other_obs = |image_y: f32, anchor_y: f32| {
+        let other_obs = |image_y: f32, anchor_y: f32| {
             let mut o = obs(image_y, anchor_y);
             o.track_id = other;
             o
         };
-        assert!(other_rule.process_frame(&[other_obs(150.0, 50.0)]).is_empty());
+        assert!(other_rule
+            .process_frame(&[other_obs(150.0, 50.0)])
+            .is_empty());
     }
 
     #[test]
@@ -212,8 +207,8 @@ mod tests {
 
         // Another zone must not create an event even if its point is inside
         // this rule's polygon.
-        assert!(
-            rule.process_frame(&[observation(
+        assert!(rule
+            .process_frame(&[observation(
                 track,
                 1.0,
                 50.0,
@@ -221,8 +216,7 @@ mod tests {
                 Some("zone-b"),
                 Some(60.0)
             )])
-            .is_empty()
-        );
+            .is_empty());
         // Own zone: first speeding event.
         assert_eq!(
             rule.process_frame(&[observation(
@@ -237,8 +231,8 @@ mod tests {
             1
         );
         // Still speeding in the same episode: suppressed.
-        assert!(
-            rule.process_frame(&[observation(
+        assert!(rule
+            .process_frame(&[observation(
                 track,
                 1.2,
                 50.0,
@@ -246,11 +240,10 @@ mod tests {
                 Some("zone-a"),
                 Some(60.0)
             )])
-            .is_empty()
-        );
+            .is_empty());
         // Leaving the zone clears the deduplication record.
-        assert!(
-            rule.process_frame(&[observation(
+        assert!(rule
+            .process_frame(&[observation(
                 track,
                 1.3,
                 50.0,
@@ -258,8 +251,7 @@ mod tests {
                 Some("zone-b"),
                 Some(60.0)
             )])
-            .is_empty()
-        );
+            .is_empty());
         // A later visit to the own zone can report again.
         assert_eq!(
             rule.process_frame(&[observation(

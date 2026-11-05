@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+
+use crate::lib::constants::EPSILON;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::lib::track_observations::TrackObservation;
@@ -166,20 +168,18 @@ fn build_rules_for_zone(zone: &Zone, runtime: &RuleRuntimeConfig) -> Vec<Box<dyn
         )));
     }
 
-    if let Some(rule) = &rules.wrong_way {
-        if let Some(virtual_line) = zone.get_virtual_line() {
-            if let Some(allowed_direction) =
-                allowed_direction_from_virtual_line(virtual_line.line, virtual_line.direction)
-            {
-                out.push(Box::new(WrongWayRule::from_embedded(
-                    zone_id.clone(),
-                    geometry.clone(),
-                    allowed_direction,
-                    rule.min_direction_samples,
-                    *runtime,
-                )));
-            }
-        }
+    if let Some(rule) = &rules.wrong_way
+        && let Some(virtual_line) = zone.get_virtual_line()
+        && let Some(allowed_direction) =
+            allowed_direction_from_virtual_line(virtual_line.line, virtual_line.direction)
+    {
+        out.push(Box::new(WrongWayRule::from_embedded(
+            zone_id.clone(),
+            geometry.clone(),
+            allowed_direction,
+            rule.min_direction_samples,
+            *runtime,
+        )));
     }
 
     if let Some(solid_line) = zone.get_solid_line().filter(|line| line.is_valid()) {
@@ -211,16 +211,14 @@ fn allowed_direction_from_virtual_line(
     let dy = by - ay;
 
     let length = (dx * dx + dy * dy).sqrt();
-    if !length.is_finite() || length <= f32::EPSILON {
+    if !length.is_finite() || length <= EPSILON {
         return None;
     }
 
     let left_normal = [-dy / length, dx / length];
 
     let vector = match direction {
-        crate::lib::zones::VirtualLineDirection::Inbound => {
-            [-left_normal[0], -left_normal[1]]
-        }
+        crate::lib::zones::VirtualLineDirection::Inbound => [-left_normal[0], -left_normal[1]],
         crate::lib::zones::VirtualLineDirection::Outbound => left_normal,
     };
 
@@ -232,9 +230,7 @@ mod tests {
     use super::*;
     use crate::lib::data_storage::new_datastorage;
     use crate::lib::track_observations::test_support::observation;
-    use crate::settings::{
-        LaneRulesSettings, LaneSpeedingRuleSettings, RoadLanesSettings,
-    };
+    use crate::settings::{LaneRulesSettings, LaneSpeedingRuleSettings, RoadLanesSettings};
     use uuid::Uuid;
 
     fn lane_with_speeding(threshold_kmh: f32, id: &str) -> RoadLanesSettings {
@@ -247,30 +243,10 @@ mod tests {
             color_rgb: [255, 0, 0],
             virtual_line: None,
             rules: LaneRulesSettings {
-                speeding: Some(LaneSpeedingRuleSettings {
-                    threshold_kmh,
-                }),
+                speeding: Some(LaneSpeedingRuleSettings { threshold_kmh }),
                 ..LaneRulesSettings::default()
             },
         }
-    }
-
-    fn coordinator_for(lane: &RoadLanesSettings) -> ViolationCoordinator {
-        let storage = new_datastorage("eq".to_string());
-        storage
-            .write()
-            .unwrap()
-            .insert_zone(Zone::from(lane))
-            .unwrap();
-        let zones = storage.read().unwrap().zones.clone();
-        ViolationCoordinator::new(
-            zones,
-            ViolationsSettings {
-                enabled: true,
-                state_ttl_sec: 7.0,
-                cleanup_interval_sec: 1.0,
-            },
-        )
     }
 
     #[test]
@@ -295,16 +271,28 @@ mod tests {
         // Speeding inside the polygon fires.
         assert_eq!(
             coordinator
-                .process_frame(&[observation(track, 1.0, 50.0, 50.0, Some("zone-1"), Some(60.0))])
+                .process_frame(&[observation(
+                    track,
+                    1.0,
+                    50.0,
+                    50.0,
+                    Some("zone-1"),
+                    Some(60.0)
+                )])
                 .len(),
             1
         );
         // The same episode is suppressed.
-        assert!(
-            coordinator
-                .process_frame(&[observation(track, 1.1, 50.0, 50.0, Some("zone-1"), Some(60.0))])
-                .is_empty()
-        );
+        assert!(coordinator
+            .process_frame(&[observation(
+                track,
+                1.1,
+                50.0,
+                50.0,
+                Some("zone-1"),
+                Some(60.0)
+            )])
+            .is_empty());
 
         // The zone is moved through the API path: the polygon no longer
         // covers (50, 50). The rules must follow on the next frame, without a
@@ -320,16 +308,28 @@ mod tests {
             zone.update_pixel_map([[200, 200], [300, 200], [300, 300], [200, 300]]);
         }
         let other = Uuid::new_v4();
-        assert!(
-            coordinator
-                .process_frame(&[observation(other, 2.0, 50.0, 50.0, Some("zone-1"), Some(60.0))])
-                .is_empty()
-        );
+        assert!(coordinator
+            .process_frame(&[observation(
+                other,
+                2.0,
+                50.0,
+                50.0,
+                Some("zone-1"),
+                Some(60.0)
+            )])
+            .is_empty());
 
         // A point inside the new polygon fires again.
         assert_eq!(
             coordinator
-                .process_frame(&[observation(other, 2.1, 250.0, 250.0, Some("zone-1"), Some(60.0))])
+                .process_frame(&[observation(
+                    other,
+                    2.1,
+                    250.0,
+                    250.0,
+                    Some("zone-1"),
+                    Some(60.0)
+                )])
                 .len(),
             1
         );
@@ -357,11 +357,16 @@ mod tests {
         let track = Uuid::new_v4();
 
         // No rules configured: nothing fires.
-        assert!(
-            coordinator
-                .process_frame(&[observation(track, 1.0, 50.0, 50.0, Some("zone-1"), Some(60.0))])
-                .is_empty()
-        );
+        assert!(coordinator
+            .process_frame(&[observation(
+                track,
+                1.0,
+                50.0,
+                50.0,
+                Some("zone-1"),
+                Some(60.0)
+            )])
+            .is_empty());
 
         // The zone gains a speeding rule while running.
         {
@@ -381,7 +386,14 @@ mod tests {
         }
         assert_eq!(
             coordinator
-                .process_frame(&[observation(track, 1.1, 50.0, 50.0, Some("zone-1"), Some(60.0))])
+                .process_frame(&[observation(
+                    track,
+                    1.1,
+                    50.0,
+                    50.0,
+                    Some("zone-1"),
+                    Some(60.0)
+                )])
                 .len(),
             1
         );

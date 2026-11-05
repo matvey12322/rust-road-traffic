@@ -57,7 +57,10 @@ impl Aabb {
     }
 
     pub fn center(&self) -> Point2f {
-        Point2f::new((self.min_x + self.max_x) / 2.0, (self.min_y + self.max_y) / 2.0)
+        Point2f::new(
+            (self.min_x + self.max_x) / 2.0,
+            (self.min_y + self.max_y) / 2.0,
+        )
     }
 
     /// Smallest box that contains both boxes.
@@ -80,7 +83,11 @@ impl Aabb {
     /// The box grown by `margin` on every side. A non-finite or negative
     /// margin is treated as zero.
     pub fn expanded(&self, margin: f32) -> Self {
-        let margin = if margin.is_finite() { margin.max(0.0) } else { 0.0 };
+        let margin = if margin.is_finite() {
+            margin.max(0.0)
+        } else {
+            0.0
+        };
         Aabb {
             min_x: self.min_x - margin,
             min_y: self.min_y - margin,

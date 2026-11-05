@@ -3,8 +3,6 @@
 //! for the configured duration is reported once, until it leaves the zone or
 //! moves again.
 
-use uuid::Uuid;
-
 use crate::lib::spatial::Point2f;
 use crate::lib::track_observations::TrackObservation;
 use crate::lib::zones::geometry::polygon_contains_point;
@@ -214,11 +212,14 @@ impl StationaryZoneRule {
 mod tests {
     use super::*;
     use crate::lib::track_observations::test_support::observation;
+    use uuid::Uuid;
     use crate::settings::LaneZoneViolationRuleSettings;
     use crate::violations::coordinator::RuleRuntimeConfig;
 
-    const KINDS: [StationaryRuleKind; 2] =
-        [StationaryRuleKind::NoParking, StationaryRuleKind::NoStopping];
+    const KINDS: [StationaryRuleKind; 2] = [
+        StationaryRuleKind::NoParking,
+        StationaryRuleKind::NoStopping,
+    ];
 
     fn rule(kind: StationaryRuleKind) -> StationaryZoneRule {
         StationaryZoneRule::from_embedded(

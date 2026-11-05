@@ -52,7 +52,7 @@ impl<V: TrackStateEntry> RuleStateStore<V> {
     /// Whether the track's entry is stale at `now`: never seen since the TTL
     /// passed, or seen with a negative age.
     pub fn expired(&self, track_id: &Uuid, now: f32) -> bool {
-        self.entries.get(track_id).map_or(false, |state| {
+        self.entries.get(track_id).is_some_and(|state| {
             let age = now - state.last_seen_at();
             age < 0.0 || age > self.state_ttl_sec
         })
@@ -78,11 +78,12 @@ impl<V: TrackStateEntry> RuleStateStore<V> {
         self.entries.remove(track_id)
     }
 
-    pub fn entry(&mut self, track_id: Uuid) -> Entry<Uuid, V> {
+    pub fn entry(&mut self, track_id: Uuid) -> Entry<'_, Uuid, V> {
         self.entries.entry(track_id)
     }
 
     /// Test hook: how many tracks this store currently remembers.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }

@@ -647,8 +647,7 @@ fn run(
         // One observation per active track and frame for the violation rules.
         // The batch is built only when violations are enabled, and published
         // once per frame: the observer runs every rule on the whole frame.
-        let mut frame_observations: Vec<TrackObservation> =
-            Vec::with_capacity(object_ids.len());
+        let mut frame_observations: Vec<TrackObservation> = Vec::with_capacity(object_ids.len());
         perf_stages.count("active_tracks", object_ids.len() as u64);
 
         for object_id in object_ids {
@@ -1121,7 +1120,10 @@ async fn main() {
             error!(scope = logging::SCOPE_PROCESSING, error = %err, "Error in main thread");
         }
         Ok(Err(_)) => {
-            error!(scope = logging::SCOPE_PROCESSING, "Detection thread panicked");
+            error!(
+                scope = logging::SCOPE_PROCESSING,
+                "Detection thread panicked"
+            );
         }
         Err(err) => {
             error!(scope = logging::SCOPE_PROCESSING, error = %err, "Can't wait for the detection thread");

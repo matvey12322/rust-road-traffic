@@ -166,7 +166,12 @@ pub fn segment_intersects_rect(start: Point2f, end: Point2f, rect: &Aabb) -> boo
 
 /// Point where two finite segments cross, when it is defined. Collinear
 /// overlap returns `None`; the caller decides on a fallback.
-pub fn segment_intersection_point(a: Point2f, b: Point2f, c: Point2f, d: Point2f) -> Option<Point2f> {
+pub fn segment_intersection_point(
+    a: Point2f,
+    b: Point2f,
+    c: Point2f,
+    d: Point2f,
+) -> Option<Point2f> {
     let rx = b.x - a.x;
     let ry = b.y - a.y;
     let sx = d.x - c.x;
@@ -263,11 +268,19 @@ mod point_helpers_tests {
     fn segment_intersects_rectangle() {
         let rect = Aabb::new(10.0, 10.0, 30.0, 30.0);
         let pt = |x: f32, y: f32| Point2f::new(x, y);
-        assert!(segment_intersects_rect(pt(0.0, 20.0), pt(40.0, 20.0), &rect));
+        assert!(segment_intersects_rect(
+            pt(0.0, 20.0),
+            pt(40.0, 20.0),
+            &rect
+        ));
         // Diagonally through opposite corners.
         assert!(segment_intersects_rect(pt(0.0, 0.0), pt(40.0, 40.0), &rect));
         // One endpoint inside.
-        assert!(segment_intersects_rect(pt(20.0, 20.0), pt(50.0, 50.0), &rect));
+        assert!(segment_intersects_rect(
+            pt(20.0, 20.0),
+            pt(50.0, 50.0),
+            &rect
+        ));
         // Fully outside.
         assert!(!segment_intersects_rect(pt(0.0, 5.0), pt(40.0, 5.0), &rect));
     }
@@ -281,7 +294,10 @@ mod point_helpers_tests {
         let point = segment_intersection_point(a, b, c, d).expect("crossing");
         assert!((point.x - 50.0).abs() < EPSILON && (point.y - 50.0).abs() < EPSILON);
         // Parallel segments have no crossing point.
-        assert_eq!(segment_intersection_point(a, b, Point2f::new(0.0, 60.0), Point2f::new(100.0, 60.0)), None);
+        assert_eq!(
+            segment_intersection_point(a, b, Point2f::new(0.0, 60.0), Point2f::new(100.0, 60.0)),
+            None
+        );
     }
 
     #[test]
