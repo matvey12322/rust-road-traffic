@@ -2,12 +2,13 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use crate::lib::track_observations::{PointPx, TrackObservation};
+use crate::lib::spatial::Point2f;
+use crate::lib::track_observations::TrackObservation;
+use crate::lib::zones::geometry::polygon_contains_point;
 use crate::settings::LaneZoneViolationRuleSettings;
 use crate::violations::coordinator::RuleRuntimeConfig;
 use crate::violations::event::{ViolationEvent, ViolationStatus};
 use crate::violations::rules::ViolationRule;
-use crate::violations::rules::geometry::contains_point;
 
 /// A stationary period must be observed continuously. A longer gap means the
 /// track was not visible and the timer restarts.
@@ -23,7 +24,7 @@ struct TrackState {
 pub struct NoParkingRule {
     rule_id: String,
     zone_id: String,
-    polygon_px: Vec<PointPx>,
+    polygon_px: Vec<Point2f>,
     min_duration_sec: f32,
     stationary_speed_kmh: f32,
 
@@ -48,10 +49,7 @@ impl NoParkingRule {
             zone_id,
             polygon_px: geometry
                 .into_iter()
-                .map(|pt| PointPx {
-                    x: pt[0] as f32,
-                    y: pt[1] as f32,
-                })
+                .map(|pt| Point2f::new(pt[0] as f32, pt[1] as f32))
                 .collect(),
             min_duration_sec: settings.min_duration_sec,
             stationary_speed_kmh: settings.stationary_speed_kmh,
@@ -151,7 +149,7 @@ impl ViolationRule for NoParkingRule {
             return Vec::new();
         }
 
-        if !contains_point(&self.polygon_px, &obs.image_point_px) {
+        if !polygon_contains_point(&self.polygon_px, obs.image_point_px.x, obs.image_point_px.y) {
             self.tracks.remove(&obs.track_id);
             return Vec::new();
         }

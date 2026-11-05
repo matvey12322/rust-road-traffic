@@ -2,17 +2,18 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use crate::lib::track_observations::{PointPx, TrackObservation};
+use crate::lib::spatial::Point2f;
+use crate::lib::track_observations::TrackObservation;
+use crate::lib::zones::geometry::polygon_contains_point;
 use crate::settings::LaneSpeedingRuleSettings;
 use crate::violations::coordinator::RuleRuntimeConfig;
 use crate::violations::event::{ViolationEvent, ViolationStatus};
 use crate::violations::rules::ViolationRule;
-use crate::violations::rules::geometry::contains_point;
 
 pub struct SpeedingRule {
     rule_id: String,
     zone_id: String,
-    polygon_px: Vec<PointPx>,
+    polygon_px: Vec<Point2f>,
     threshold_kmh: f32,
     fired_tracks: HashMap<Uuid, f32>,
 
@@ -35,10 +36,7 @@ impl SpeedingRule {
             zone_id,
             polygon_px: geometry
                 .into_iter()
-                .map(|pt| PointPx {
-                    x: pt[0] as f32,
-                    y: pt[1] as f32,
-                })
+                .map(|pt| Point2f::new(pt[0] as f32, pt[1] as f32))
                 .collect(),
             threshold_kmh: settings.threshold_kmh,
             fired_tracks: HashMap::new(),
@@ -137,7 +135,7 @@ impl ViolationRule for SpeedingRule {
             return Vec::new();
         }
 
-        if !contains_point(&self.polygon_px, &obs.anchor_px) {
+        if !polygon_contains_point(&self.polygon_px, obs.anchor_px.x, obs.anchor_px.y) {
             self.fired_tracks.remove(&obs.track_id);
             return Vec::new();
         }

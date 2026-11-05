@@ -1,8 +1,8 @@
+use crate::lib::cv::Rect;
+use crate::lib::spatial::Point2f;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
-
-use crate::lib::track_observations::{BoundingBoxPx, PointProjected, PointPx};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,10 +25,10 @@ pub struct ViolationEvent {
     pub class_name: String,
     pub confidence: f32,
 
-    pub bbox: BoundingBoxPx,
-    pub anchor_px: PointPx,
-    pub image_point_px: PointPx,
-    pub projected_point: Option<PointProjected>,
+    pub bbox: Rect,
+    pub anchor_px: Point2f,
+    pub image_point_px: Point2f,
+    pub projected_point: Option<Point2f>,
 
     pub zone_id: Option<String>,
     pub previous_zone_id: Option<String>,
@@ -41,7 +41,7 @@ pub struct ViolationEvent {
     pub solid_line_id: Option<String>,
     /// Point where the track crossed the solid line, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub intersection_px: Option<PointPx>,
+    pub intersection_px: Option<Point2f>,
     pub rule_id: String,
     pub details: String,
 }

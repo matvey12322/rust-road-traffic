@@ -14,7 +14,12 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use crate::lib::track_observations::{BoundingBoxPx, PointPx, TrackObservation};
+use crate::lib::cv::Rect;
+use crate::lib::spatial::{Aabb, Point2f};
+use crate::lib::track_observations::TrackObservation;
+use crate::lib::zones::geometry::{
+    is_intersects, line_signed_distance, segment_intersection_point, segment_intersects_rect,
+};
 use crate::lib::zones::SolidLine;
 use crate::violations::event::{ViolationEvent, ViolationStatus};
 
@@ -29,89 +34,6 @@ const MAX_CELLS_PER_LINE: usize = 256;
 /// A query spanning more cells than this falls back to checking all lines.
 /// This keeps a bogus, huge bounding box from making the query loop very long.
 const MAX_CELLS_PER_QUERY: usize = 4096;
-
-const GEOMETRY_EPSILON: f32 = 1e-3;
-
-/// Axis-aligned bounding box in frame pixels.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Aabb {
-    pub min_x: f32,
-    pub min_y: f32,
-    pub max_x: f32,
-    pub max_y: f32,
-}
-
-impl Aabb {
-    pub fn new(min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Self {
-        Aabb {
-            min_x: min_x.min(max_x),
-            min_y: min_y.min(max_y),
-            max_x: min_x.max(max_x),
-            max_y: min_y.max(max_y),
-        }
-    }
-
-    pub fn from_bbox(bbox: &BoundingBoxPx) -> Self {
-        let x = bbox.x as f32;
-        let y = bbox.y as f32;
-        let right = x + bbox.width as f32;
-        let bottom = y + bbox.height as f32;
-        Aabb::new(x, y, right, bottom)
-    }
-
-    pub fn point(point: &PointPx) -> Self {
-        Aabb {
-            min_x: point.x,
-            min_y: point.y,
-            max_x: point.x,
-            max_y: point.y,
-        }
-    }
-
-    pub fn center(&self) -> PointPx {
-        PointPx {
-            x: (self.min_x + self.max_x) / 2.0,
-            y: (self.min_y + self.max_y) / 2.0,
-        }
-    }
-
-    pub fn union(&self, other: &Aabb) -> Self {
-        Aabb {
-            min_x: self.min_x.min(other.min_x),
-            min_y: self.min_y.min(other.min_y),
-            max_x: self.max_x.max(other.max_x),
-            max_y: self.max_y.max(other.max_y),
-        }
-    }
-
-    pub fn intersects(&self, other: &Aabb) -> bool {
-        !(self.max_x < other.min_x
-            || other.max_x < self.min_x
-            || self.max_y < other.min_y
-            || other.max_y < self.min_y)
-    }
-
-    pub fn expanded(&self, margin: f32) -> Self {
-        let margin = if margin.is_finite() {
-            margin.max(0.0)
-        } else {
-            0.0
-        };
-        Aabb {
-            min_x: self.min_x - margin,
-            min_y: self.min_y - margin,
-            max_x: self.max_x + margin,
-            max_y: self.max_y + margin,
-        }
-    }
-
-    pub fn is_finite(&self) -> bool {
-        self.min_x.is_finite()
-            && self.min_y.is_finite()
-            && self.max_x.is_finite()
-            && self.max_y.is_finite()
-    }
-}
 
 /// One configured solid line together with the zone it belongs to.
 ///
@@ -144,16 +66,10 @@ impl SolidLineDefinition {
         }
     }
 
-    fn endpoints(&self) -> (PointPx, PointPx) {
+    fn endpoints(&self) -> (Point2f, Point2f) {
         (
-            PointPx {
-                x: self.line.line[0][0],
-                y: self.line.line[0][1],
-            },
-            PointPx {
-                x: self.line.line[1][0],
-                y: self.line.line[1][1],
-            },
+            Point2f::new(self.line.line[0][0], self.line.line[0][1]),
+            Point2f::new(self.line.line[1][0], self.line.line[1][1]),
         )
     }
 
@@ -174,32 +90,25 @@ impl SolidLineDefinition {
     /// Fast AABB prefilter followed by the exact segment-rectangle test.
     /// `margin_px` widens the rectangle as well, because the margin is a
     /// corridor around the line rather than a property of the box.
-    pub fn intersects_bbox(&self, bbox: &BoundingBoxPx) -> bool {
-        let bbox_aabb = Aabb::from_bbox(bbox);
+    pub fn intersects_bbox(&self, bbox: &Rect) -> bool {
+        let bbox_aabb = Aabb::from_rect(bbox);
         if !self.expanded_aabb().intersects(&bbox_aabb) {
             return false;
         }
         let (a, b) = self.endpoints();
-        segment_intersects_rect(&a, &b, &bbox_aabb.expanded(self.margin()))
+        segment_intersects_rect(a, b, &bbox_aabb.expanded(self.margin()))
     }
 
     /// Signed perpendicular distance from the line through its endpoints, in
     /// pixels. Positive and negative values are opposite sides.
-    fn signed_distance(&self, point: &PointPx) -> f32 {
+    fn signed_distance(&self, point: Point2f) -> f32 {
         let (a, b) = self.endpoints();
-        let dx = b.x - a.x;
-        let dy = b.y - a.y;
-        let length = (dx * dx + dy * dy).sqrt();
-        if !length.is_finite() || length <= GEOMETRY_EPSILON {
-            return 0.0;
-        }
-        let area2 = (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x);
-        area2 / length
+        line_signed_distance(a, b, point)
     }
 
     /// 1 and -1 are opposite sides, 0 is the neutral band of half-width
     /// `margin_px` around the line.
-    fn classify_side(&self, point: &PointPx) -> i32 {
+    fn classify_side(&self, point: Point2f) -> i32 {
         let distance = self.signed_distance(point);
         let margin = self.margin();
         if distance > margin {
@@ -351,7 +260,7 @@ struct TrackState {
     /// Last centre that was outside the neutral `margin_px` band. A vehicle
     /// crossing the band over several frames still has a point on each side to
     /// compare, so a thick margin does not hide the crossing.
-    last_non_neutral_center: PointPx,
+    last_non_neutral_center: Point2f,
     last_non_neutral_side: i32,
     last_seen_at: f32,
     fired: bool,
@@ -368,7 +277,7 @@ pub struct SolidLineDetector {
     /// free of String allocations: lookups use `&str`, and the line id is
     /// cloned only when a line is seen for the first time.
     tracks: HashMap<String, HashMap<Uuid, TrackState>>,
-    last_centers: HashMap<Uuid, (PointPx, f32)>,
+    last_centers: HashMap<Uuid, (Point2f, f32)>,
     line_signatures: HashMap<String, LineSignature>,
     /// Bucket grid over the current lines. Rebuilt only when the line set or
     /// its geometry changes, not on every frame.
@@ -441,7 +350,7 @@ impl SolidLineDetector {
                 continue;
             }
 
-            let bbox = Aabb::from_bbox(&obs.bbox);
+            let bbox = Aabb::from_rect(&obs.bbox);
             if !bbox.is_finite() {
                 continue;
             }
@@ -452,7 +361,7 @@ impl SolidLineDetector {
             // sampled box. The query covers the whole swept area, so such a
             // crossing still finds its line.
             let query = match self.last_centers.get(&obs.track_id) {
-                Some((previous, _)) => bbox.union(&Aabb::point(previous)),
+                Some((previous, _)) => bbox.union(&Aabb::point(*previous)),
                 None => bbox,
             };
 
@@ -461,7 +370,7 @@ impl SolidLineDetector {
             while scratch_index < self.scratch.len() {
                 let line_index = self.scratch[scratch_index];
                 let line = &lines[line_index];
-                if let Some(event) = self.process_line(line, obs, &center, now) {
+                if let Some(event) = self.process_line(line, obs, center, now) {
                     events.push(event);
                 }
                 scratch_index += 1;
@@ -527,7 +436,7 @@ impl SolidLineDetector {
         &mut self,
         line: &SolidLineDefinition,
         obs: &TrackObservation,
-        center: &PointPx,
+        center: Point2f,
         now: f32,
     ) -> Option<ViolationEvent> {
         if !line.line.is_valid() {
@@ -558,7 +467,7 @@ impl SolidLineDetector {
             .or_default()
             .entry(obs.track_id)
             .or_insert_with(|| TrackState {
-                last_non_neutral_center: center.clone(),
+                last_non_neutral_center: center,
                 last_non_neutral_side: side,
                 last_seen_at: now,
                 fired: false,
@@ -567,7 +476,7 @@ impl SolidLineDetector {
 
         if state.fired {
             if side != 0 {
-                state.last_non_neutral_center = center.clone();
+                state.last_non_neutral_center = center;
                 state.last_non_neutral_side = side;
             }
             return None;
@@ -577,14 +486,23 @@ impl SolidLineDetector {
         // the immediately previous frame: with a wide margin the previous side
         // is often 0, and the crossing would otherwise be lost.
         let previous_side = state.last_non_neutral_side;
-        let previous_center = state.last_non_neutral_center.clone();
+        let previous_center = state.last_non_neutral_center;
         let changed_side = previous_side != 0 && side != 0 && previous_side != side;
-        let path_crosses =
-            changed_side && segments_intersect(&previous_center, center, &line_start, &line_end);
+        let path_crosses = changed_side
+            && is_intersects(
+                previous_center.x,
+                previous_center.y,
+                center.x,
+                center.y,
+                line_start.x,
+                line_start.y,
+                line_end.x,
+                line_end.y,
+            );
         let crossed = changed_side && (touches || path_crosses);
 
         if side != 0 {
-            state.last_non_neutral_center = center.clone();
+            state.last_non_neutral_center = center;
             state.last_non_neutral_side = side;
         }
 
@@ -593,9 +511,8 @@ impl SolidLineDetector {
         }
         state.fired = true;
 
-        let intersection =
-            segment_intersection_point(&previous_center, center, &line_start, &line_end)
-                .unwrap_or_else(|| center.clone());
+        let intersection = segment_intersection_point(previous_center, center, line_start, line_end)
+            .unwrap_or(center);
 
         Some(make_event(line, obs, previous_side, side, intersection))
     }
@@ -612,7 +529,7 @@ fn make_event(
     obs: &TrackObservation,
     previous_side: i32,
     side: i32,
-    intersection: PointPx,
+    intersection: Point2f,
 ) -> ViolationEvent {
     ViolationEvent {
         event_id: Uuid::new_v4(),
@@ -624,10 +541,10 @@ fn make_event(
         source_time_relative_sec: obs.source_time_relative_sec,
         class_name: obs.class_name.clone(),
         confidence: obs.confidence,
-        bbox: obs.bbox.clone(),
-        anchor_px: obs.anchor_px.clone(),
-        image_point_px: obs.image_point_px.clone(),
-        projected_point: obs.projected_point.clone(),
+        bbox: obs.bbox,
+        anchor_px: obs.anchor_px,
+        image_point_px: obs.image_point_px,
+        projected_point: obs.projected_point,
         zone_id: line.zone_id.clone(),
         previous_zone_id: obs.previous_zone_id.clone(),
         crossed_virtual_line: obs.crossed_virtual_line,
@@ -640,115 +557,6 @@ fn make_event(
             line.id, previous_side, side
         ),
     }
-}
-
-fn signed_area2(a: &PointPx, b: &PointPx, c: &PointPx) -> f32 {
-    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
-}
-
-fn on_segment(a: &PointPx, b: &PointPx, point: &PointPx) -> bool {
-    point.x >= a.x.min(b.x) - GEOMETRY_EPSILON
-        && point.x <= a.x.max(b.x) + GEOMETRY_EPSILON
-        && point.y >= a.y.min(b.y) - GEOMETRY_EPSILON
-        && point.y <= a.y.max(b.y) + GEOMETRY_EPSILON
-}
-
-fn segments_intersect(a: &PointPx, b: &PointPx, c: &PointPx, d: &PointPx) -> bool {
-    let ab_c = signed_area2(a, b, c);
-    let ab_d = signed_area2(a, b, d);
-    let cd_a = signed_area2(c, d, a);
-    let cd_b = signed_area2(c, d, b);
-
-    if ab_c.abs() <= GEOMETRY_EPSILON && on_segment(a, b, c) {
-        return true;
-    }
-    if ab_d.abs() <= GEOMETRY_EPSILON && on_segment(a, b, d) {
-        return true;
-    }
-    if cd_a.abs() <= GEOMETRY_EPSILON && on_segment(c, d, a) {
-        return true;
-    }
-    if cd_b.abs() <= GEOMETRY_EPSILON && on_segment(c, d, b) {
-        return true;
-    }
-
-    let ab_cross = (ab_c > 0.0 && ab_d < 0.0) || (ab_c < 0.0 && ab_d > 0.0);
-    let cd_cross = (cd_a > 0.0 && cd_b < 0.0) || (cd_a < 0.0 && cd_b > 0.0);
-
-    ab_cross && cd_cross
-}
-
-/// Point where two finite segments cross, when it is defined. Collinear
-/// overlap returns `None`; the caller falls back to the current box centre.
-fn segment_intersection_point(
-    a: &PointPx,
-    b: &PointPx,
-    c: &PointPx,
-    d: &PointPx,
-) -> Option<PointPx> {
-    let rx = b.x - a.x;
-    let ry = b.y - a.y;
-    let sx = d.x - c.x;
-    let sy = d.y - c.y;
-    let denominator = rx * sy - ry * sx;
-    if denominator.abs() <= GEOMETRY_EPSILON {
-        return None;
-    }
-
-    let cax = c.x - a.x;
-    let cay = c.y - a.y;
-    let t = (cax * sy - cay * sx) / denominator;
-    let u = (cax * ry - cay * rx) / denominator;
-    if !(-GEOMETRY_EPSILON..=1.0 + GEOMETRY_EPSILON).contains(&t)
-        || !(-GEOMETRY_EPSILON..=1.0 + GEOMETRY_EPSILON).contains(&u)
-    {
-        return None;
-    }
-
-    Some(PointPx {
-        x: a.x + t * rx,
-        y: a.y + t * ry,
-    })
-}
-
-fn point_in_rect(point: &PointPx, rect: &Aabb) -> bool {
-    point.x >= rect.min_x - GEOMETRY_EPSILON
-        && point.x <= rect.max_x + GEOMETRY_EPSILON
-        && point.y >= rect.min_y - GEOMETRY_EPSILON
-        && point.y <= rect.max_y + GEOMETRY_EPSILON
-}
-
-fn segment_intersects_rect(segment_start: &PointPx, segment_end: &PointPx, rect: &Aabb) -> bool {
-    if point_in_rect(segment_start, rect) || point_in_rect(segment_end, rect) {
-        return true;
-    }
-
-    let corners = [
-        PointPx {
-            x: rect.min_x,
-            y: rect.min_y,
-        },
-        PointPx {
-            x: rect.max_x,
-            y: rect.min_y,
-        },
-        PointPx {
-            x: rect.max_x,
-            y: rect.max_y,
-        },
-        PointPx {
-            x: rect.min_x,
-            y: rect.max_y,
-        },
-    ];
-
-    for index in 0..4 {
-        let next = (index + 1) % 4;
-        if segments_intersect(segment_start, segment_end, &corners[index], &corners[next]) {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -774,20 +582,9 @@ mod tests {
             source_time_relative_sec: time,
             class_name: "car".to_string(),
             confidence: 0.9,
-            bbox: BoundingBoxPx {
-                x: left,
-                y: top,
-                width,
-                height,
-            },
-            anchor_px: PointPx {
-                x: center_x,
-                y: center_y + height as f32 / 2.0,
-            },
-            image_point_px: PointPx {
-                x: center_x,
-                y: center_y,
-            },
+            bbox: Rect::new(left, top, width, height),
+            anchor_px: Point2f::new(center_x, center_y + height as f32 / 2.0),
+            image_point_px: Point2f::new(center_x, center_y),
             projected_point: None,
             speed_kmh: None,
             zone_id: zone_id.map(str::to_string),
@@ -809,49 +606,39 @@ mod tests {
     fn segment_intersects_rectangle() {
         let rect = Aabb::new(10.0, 10.0, 30.0, 30.0);
         assert!(segment_intersects_rect(
-            &PointPx { x: 0.0, y: 20.0 },
-            &PointPx { x: 40.0, y: 20.0 },
+            Point2f::new(0.0, 20.0),
+            Point2f::new(40.0, 20.0),
             &rect
         ));
         // Diagonally through opposite corners.
         assert!(segment_intersects_rect(
-            &PointPx { x: 0.0, y: 0.0 },
-            &PointPx { x: 40.0, y: 40.0 },
+            Point2f::new(0.0, 0.0),
+            Point2f::new(40.0, 40.0),
             &rect
         ));
         // One endpoint inside.
         assert!(segment_intersects_rect(
-            &PointPx { x: 20.0, y: 20.0 },
-            &PointPx { x: 50.0, y: 50.0 },
+            Point2f::new(20.0, 20.0),
+            Point2f::new(50.0, 50.0),
             &rect
         ));
         // Fully outside.
         assert!(!segment_intersects_rect(
-            &PointPx { x: 0.0, y: 5.0 },
-            &PointPx { x: 40.0, y: 5.0 },
+            Point2f::new(0.0, 5.0),
+            Point2f::new(40.0, 5.0),
             &rect
         ));
     }
 
     #[test]
     fn line_bbox_intersection_respects_margin() {
-        let bbox = BoundingBoxPx {
-            x: 50,
-            y: 85,
-            width: 20,
-            height: 10,
-        };
+        let bbox = Rect::new(50, 85, 20, 10);
         let with_margin = horizontal_line("line", 100.0, 10.0);
         let without_margin = horizontal_line("line", 100.0, 0.0);
 
         assert!(with_margin.intersects_bbox(&bbox));
         assert!(!without_margin.intersects_bbox(&bbox));
-        assert!(!with_margin.intersects_bbox(&BoundingBoxPx {
-            x: 300,
-            y: 85,
-            width: 20,
-            height: 10,
-        }));
+        assert!(!with_margin.intersects_bbox(&Rect::new(300, 85, 20, 10)));
     }
 
     #[test]
@@ -863,14 +650,9 @@ mod tests {
             SolidLine::new([[1000.0, 1000.0], [1100.0, 1000.0]], 0.0),
         );
         let index = SolidLineIndex::new(&[near, far]);
-        let bbox = BoundingBoxPx {
-            x: 10,
-            y: 90,
-            width: 20,
-            height: 20,
-        };
+        let bbox = Rect::new(10, 90, 20, 20);
 
-        assert_eq!(index.candidates(&Aabb::from_bbox(&bbox)), vec![0]);
+        assert_eq!(index.candidates(&Aabb::from_rect(&bbox)), vec![0]);
     }
 
     #[test]
@@ -882,14 +664,9 @@ mod tests {
         );
         let short = horizontal_line("short", 100.0, 0.0);
         let index = SolidLineIndex::new(&[long, short]);
-        let bbox = BoundingBoxPx {
-            x: 10,
-            y: 90,
-            width: 20,
-            height: 20,
-        };
+        let bbox = Rect::new(10, 90, 20, 20);
 
-        let candidates = index.candidates(&Aabb::from_bbox(&bbox));
+        let candidates = index.candidates(&Aabb::from_rect(&bbox));
         assert!(candidates.contains(&0));
         assert!(candidates.contains(&1));
     }

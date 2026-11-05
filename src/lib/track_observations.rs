@@ -1,3 +1,5 @@
+use crate::lib::cv::Rect;
+use crate::lib::spatial::Point2f;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::sync::Arc;
@@ -9,31 +11,6 @@ pub type TrackObservations = broadcast::Sender<Arc<TrackObservation>>;
 
 /// Broadcast receiver used by an individual track observation consumer.
 pub type TrackObservationRx = broadcast::Receiver<Arc<TrackObservation>>;
-
-/// A point in video-frame pixel coordinates.
-#[derive(Debug, Clone, Serialize)]
-pub struct PointPx {
-    pub x: f32,
-    pub y: f32,
-}
-
-/// A point in the coordinate space used by the zone projection.
-#[derive(Debug, Clone, Serialize)]
-pub struct PointProjected {
-    pub x: f32,
-    pub y: f32,
-}
-
-/// An axis-aligned bounding box in video-frame pixel coordinates.
-#[derive(Debug, Clone, Serialize)]
-pub struct BoundingBoxPx {
-    /// Horizontal coordinate of the top-left corner.
-    pub x: i32,
-    /// Vertical coordinate of the top-left corner.
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-}
 
 /// A snapshot of a tracked object's geometry, metadata, and zone context.
 #[derive(Debug, Clone, Serialize)]
@@ -54,14 +31,14 @@ pub struct TrackObservation {
     pub confidence: f32,
 
     /// Object bounding box in the video frame.
-    pub bbox: BoundingBoxPx,
+    pub bbox: Rect,
     /// Anchor point supplied by the producer, typically the bottom center
     /// of the bounding box.
-    pub anchor_px: PointPx,
+    pub anchor_px: Point2f,
     /// Image-space track point used for zone geometry calculations.
-    pub image_point_px: PointPx,
+    pub image_point_px: Point2f,
     /// Projected point, when available.
-    pub projected_point: Option<PointProjected>,
+    pub projected_point: Option<Point2f>,
     /// Estimated speed in kilometres per hour, when available.
     pub speed_kmh: Option<f32>,
 
@@ -77,14 +54,6 @@ pub struct TrackObservation {
     pub no_match_times: usize,
 }
 
-/// Subscribes to track observations and starts an asynchronous consumer.
-///
-/// Each received observation was serialized to JSON here, but the success
-/// branch performed no output, so the serialization was pure waste: every
-/// zone observation was encoded and then discarded. The only consumer left
-/// is the violation observer in `violations::spawn_violation_observer`;
-/// nothing else needs to be spawned for console output until there is
-/// actually something to print.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -107,14 +76,9 @@ pub(crate) mod test_support {
             source_time_relative_sec: time,
             class_name: "car".to_string(),
             confidence: 0.9,
-            bbox: BoundingBoxPx {
-                x: (x - 10.0).round() as i32,
-                y: (y - 10.0).round() as i32,
-                width: 20,
-                height: 20,
-            },
-            anchor_px: PointPx { x, y },
-            image_point_px: PointPx { x, y },
+            bbox: Rect::new((x - 10.0).round() as i32, (y - 10.0).round() as i32, 20, 20),
+            anchor_px: Point2f::new(x, y),
+            image_point_px: Point2f::new(x, y),
             projected_point: None,
             speed_kmh,
             zone_id: zone_id.map(str::to_string),

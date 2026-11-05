@@ -20,10 +20,9 @@ use lib::logging;
 use lib::perf_stages::PerfStages;
 use lib::perf_stats::{PerfStats, Timer};
 use lib::publisher::RedisPublishers;
+use lib::spatial::Point2f;
 use lib::status::{DetectionStatus, InputStatus, RuntimeStatus};
-use lib::track_observations::{
-    BoundingBoxPx, PointProjected, PointPx, TrackObservation, TrackObservations,
-};
+use lib::track_observations::{TrackObservation, TrackObservations};
 use lib::tracker::{new_tracker_from_type, SpatialInfo, TrackerTrait};
 use lib::vehicle_events::VehicleEventCollector;
 use lib::zones::Zone;
@@ -740,22 +739,19 @@ fn run(
 
             let anchor_x = bbox.x + bbox.width / 2.0;
             let anchor_y = bbox.y + bbox.height;
-            let bbox_px = BoundingBoxPx {
-                x: bbox.x.floor() as i32,
-                y: bbox.y.floor() as i32,
-                width: bbox.width.round() as i32,
-                height: bbox.height.round() as i32,
-            };
-            let anchor_px = PointPx {
-                x: anchor_x,
-                y: anchor_y,
-            };
+            let bbox_px = RectCV::new(
+                bbox.x.floor() as i32,
+                bbox.y.floor() as i32,
+                bbox.width.round() as i32,
+                bbox.height.round() as i32,
+            );
+            let anchor_px = Point2f::new(anchor_x, anchor_y);
 
             // Filled if the track is inside a zone. The solid-line detector
             // does not need a zone, but a zone gives the event its speed and
             // projected point when they are available.
             let mut matched_zone_id: Option<String> = None;
-            let mut matched_projected_point: Option<PointProjected> = None;
+            let mut matched_projected_point: Option<Point2f> = None;
             let mut matched_speed_kmh: Option<f32> = None;
             let mut matched_crossed_virtual_line = false;
 
@@ -786,10 +782,7 @@ fn run(
                     false
                 };
                 matched_zone_id = Some(zone.id.clone());
-                matched_projected_point = Some(PointProjected {
-                    x: projected_pt.0,
-                    y: projected_pt.1,
-                });
+                matched_projected_point = Some(Point2f::new(projected_pt.0, projected_pt.1));
                 matched_crossed_virtual_line = crossed;
                 // Only provide zone_id_from when vehicle actually crosses the virtual line
                 let zone_id_from = if crossed {
@@ -883,10 +876,7 @@ fn run(
                     confidence: detection_confidence,
                     bbox: bbox_px,
                     anchor_px,
-                    image_point_px: PointPx {
-                        x: last_point_x,
-                        y: last_point_y,
-                    },
+                    image_point_px: Point2f::new(last_point_x, last_point_y),
                     projected_point: matched_projected_point,
                     speed_kmh: matched_speed_kmh,
                     zone_id: matched_zone_id,
