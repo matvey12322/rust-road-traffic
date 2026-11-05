@@ -91,3 +91,96 @@ impl ViolationEvent {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lib::cv::Rect;
+    use crate::lib::spatial::Point2f;
+    use crate::lib::track_observations::TrackObservation;
+    use chrono::TimeZone;
+
+    fn observation() -> TrackObservation {
+        TrackObservation {
+            equipment_id: "eq-1".to_string(),
+            track_id: Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap(),
+            observed_at: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            source_time_relative_sec: 12.5,
+            class_name: "car".to_string(),
+            confidence: 0.5,
+            bbox: Rect::new(10, 20, 30, 40),
+            anchor_px: Point2f::new(25.0, 60.0),
+            image_point_px: Point2f::new(25.0, 40.0),
+            projected_point: Some(Point2f::new(1.5, 2.5)),
+            speed_kmh: Some(88.0),
+            zone_id: Some("zone-1".to_string()),
+            previous_zone_id: None,
+            crossed_virtual_line: true,
+            no_match_times: 0,
+        }
+    }
+
+    /// The REST/event JSON contract: field names and shapes are what the
+    /// consumers expect. The random event id is excluded from the snapshot.
+    #[test]
+    fn event_json_shape_is_stable() {
+        let event = ViolationEvent::from_observation(
+            &observation(),
+            "traffic.solid_line_crossing",
+            Some("zone-1".to_string()),
+            "zone-1.solid_line".to_string(),
+            "crossed".to_string(),
+        )
+        .for_solid_line("zone-1.solid_line".to_string(), Point2f::new(3.0, 4.0));
+
+        let mut value = serde_json::to_value(&event).expect("serializable");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("event_id")
+            .expect("event id present");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "event_type": "traffic.solid_line_crossing",
+                "status": "confirmed",
+                "equipment_id": "eq-1",
+                "track_id": "11111111-2222-3333-4444-555555555555",
+                "observed_at": "2026-01-02T03:04:05Z",
+                "source_time_relative_sec": 12.5,
+                "class_name": "car",
+                "confidence": 0.5,
+                "bbox": { "x": 10, "y": 20, "width": 30, "height": 40 },
+                "anchor_px": { "x": 25.0, "y": 60.0 },
+                "image_point_px": { "x": 25.0, "y": 40.0 },
+                "projected_point": { "x": 1.5, "y": 2.5 },
+                "zone_id": "zone-1",
+                "previous_zone_id": null,
+                "crossed_virtual_line": true,
+                "speed_kmh": 88.0,
+                "solid_line_id": "zone-1.solid_line",
+                "intersection_px": { "x": 3.0, "y": 4.0 },
+                "rule_id": "zone-1.solid_line",
+                "details": "crossed",
+            })
+        );
+    }
+
+    /// Rules without a solid line keep those fields out of the JSON.
+    #[test]
+    fn non_solid_line_events_omit_solid_line_fields() {
+        let event = ViolationEvent::from_observation(
+            &observation(),
+            "traffic.speeding",
+            Some("zone-1".to_string()),
+            "zone-1.speeding".to_string(),
+            "too fast".to_string(),
+        );
+
+        let value = serde_json::to_value(&event).expect("serializable");
+        let object = value.as_object().expect("object");
+        assert!(!object.contains_key("solid_line_id"), "{value}");
+        assert!(!object.contains_key("intersection_px"), "{value}");
+    }
+}

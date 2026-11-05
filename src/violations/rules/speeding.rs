@@ -77,9 +77,10 @@ impl ViolationRule for SpeedingRule {
 }
 
 impl SpeedingRule {
-    /// Processes a track observation and emits an event when its anchor
-    /// is inside the configured polygon and its valid speed strictly
-    /// exceeds the configured threshold.
+    /// Processes a track observation and emits an event when its image point
+    /// (the same point zone matching used to assign `zone_id`) is inside the
+    /// configured polygon and its valid speed strictly exceeds the configured
+    /// threshold.
     ///
     /// Only observations from this rule's zone are considered. The
     /// deduplication record is kept while the track stays in the zone and is
@@ -105,7 +106,11 @@ impl SpeedingRule {
             return Vec::new();
         }
 
-        if !polygon_contains_point(&self.polygon_px, obs.anchor_px.x, obs.anchor_px.y) {
+        if !polygon_contains_point(
+            &self.polygon_px,
+            obs.image_point_px.x,
+            obs.image_point_px.y,
+        ) {
             self.fired_tracks.remove(&obs.track_id);
             return Vec::new();
         }
@@ -154,6 +159,50 @@ mod tests {
                 cleanup_interval_sec: 1.0,
             },
         )
+    }
+
+    #[test]
+    fn the_image_point_decides_whether_the_track_is_in_the_zone() {
+        use crate::lib::cv::Rect;
+        use crate::lib::spatial::Point2f;
+        use crate::lib::track_observations::TrackObservation;
+        use chrono::Utc;
+
+        let mut speeding = rule();
+        let track = Uuid::new_v4();
+
+        let mut obs = |image_y: f32, anchor_y: f32| TrackObservation {
+            equipment_id: "eq".to_string(),
+            track_id: track,
+            observed_at: Utc::now(),
+            source_time_relative_sec: 1.0,
+            class_name: "car".to_string(),
+            confidence: 0.9,
+            bbox: Rect::new(40, 40, 20, 20),
+            anchor_px: Point2f::new(50.0, anchor_y),
+            image_point_px: Point2f::new(50.0, image_y),
+            projected_point: None,
+            speed_kmh: Some(60.0),
+            zone_id: Some("zone-a".to_string()),
+            previous_zone_id: None,
+            crossed_virtual_line: false,
+            no_match_times: 0,
+        };
+
+        // The polygon is [0, 0]..[100, 100]: the image point inside fires
+        // even when the anchor (bbox bottom center) is outside.
+        assert_eq!(speeding.process_frame(&[obs(50.0, 150.0)]).len(), 1);
+
+        // A fresh track whose image point is outside does not fire even
+        // when the anchor is inside.
+        let mut other_rule = rule();
+        let other = Uuid::new_v4();
+        let mut other_obs = |image_y: f32, anchor_y: f32| {
+            let mut o = obs(image_y, anchor_y);
+            o.track_id = other;
+            o
+        };
+        assert!(other_rule.process_frame(&[other_obs(150.0, 50.0)]).is_empty());
     }
 
     #[test]
